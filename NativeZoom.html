@@ -1,0 +1,8 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=8"><title>鼠环 · 捏合缩放实测</title>
+<style>body{font:22px system-ui;background:#f4f5f8;color:#222;padding:48px;max-width:950px}output{font-size:44px;display:block;margin:20px 0}article{display:grid;grid-template-columns:repeat(6,110px);gap:12px}article i{background:#7ec4c2;height:100px;border-radius:12px}article i:nth-child(odd){background:#c4dddd}p{line-height:1.6}</style>
+<h1>Chrome 原生捏合实测</h1><output id="scale" aria-live="polite">原生缩放 100.0%</output><p>按住配置的鼠标键并滚动主滚轮。数字读取 Chrome 自己的 visualViewport.scale；方格没有缩放脚本。触控板捏合与 Chrome 菜单里的网页缩放不同。到达下限后不能继续缩小。</p><article id="grid"></article><p id="detail"></p><h2>横向滚动实测</h2><p>把指针放在下面的长条上，按住设为“滚轮左右平移”的鼠标键，再滚动主滚轮。数字读取浏览器实际 scrollLeft；在没有横向溢出的页面上，左右滚动本来就不会移动。</p><output id="panValue" aria-live="polite">横向位置 0 px</output><section id="pan" tabindex="0" style="overflow:auto;width:100%;border:2px solid #7da6a4;border-radius:12px"><div style="width:2600px;height:150px;background:repeating-linear-gradient(90deg,#8bc6c4 0 110px,#d5e7e7 110px 220px);display:flex;align-items:center">← 左侧　　　　　　　　　　　　　　　　　　　中间　　　　　　　　　　　　　　　　　　　右侧 →</div></section><script>
+for(let i=0;i<48;i++)grid.appendChild(document.createElement('i'));
+let changes=0;function read(){scale.textContent='原生缩放 '+(visualViewport.scale*100).toFixed(1)+'%';detail.textContent='浏览器实际视口宽度 '+visualViewport.width.toFixed(1)+'；比例更新 '+changes+' 次'}
+visualViewport.addEventListener('resize',()=>{changes++;read()});read();
+pan.addEventListener('scroll',()=>{panValue.textContent='横向位置 '+pan.scrollLeft.toFixed(0)+' px'});
+</script></html>
