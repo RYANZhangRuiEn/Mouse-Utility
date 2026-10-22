@@ -22,6 +22,10 @@ final class SettingsView: NSView, NSTextFieldDelegate {
     private var smoothPage: SmoothSettingsView!
     private let scaleSlider = NSSlider(value: 100, minValue: 80, maxValue: 125, target: nil, action: nil)
     private let delaySlider = NSSlider(value: 140, minValue: 60, maxValue: 500, target: nil, action: nil)
+    private let ringLearningStatus = NSTextField(labelWithString:""), zoomLearningStatus = NSTextField(labelWithString:"")
+    private let hapticEnabled = NSButton(checkboxWithTitle:"圆环震动",target:nil,action:nil)
+    private let hapticStrength = NSSlider(value:50,minValue:0,maxValue:100,target:nil,action:nil)
+    private let hapticValue = NSTextField(labelWithString:"50%"), hapticStatus = NSTextField(labelWithString:"")
     private let stepSlider = NSSlider(value: 10, minValue: 1, maxValue: 20, target: nil, action: nil)
     private let scaleText = NSTextField(labelWithString: ""), delayText = NSTextField(labelWithString: ""), stepText = NSTextField(labelWithString: "")
     private let reverse = NSButton(checkboxWithTitle: "反转滚轮方向", target: nil, action: nil)
@@ -35,20 +39,20 @@ final class SettingsView: NSView, NSTextFieldDelegate {
     private let mouseRecorder = RecorderButton(), detectStatus = NSTextField(labelWithString:"")
     private let thumbSpaces = NSButton(checkboxWithTitle:"横向滚轮切换桌面  ⌃← / ⌃→",target:nil,action:nil)
     private let spacesReverse = NSButton(checkboxWithTitle:"反转桌面方向",target:nil,action:nil)
-    private let mouseDefaults:[(String,KeyBinding)] = [
+    private let mouseDefaults:[(String,KeyBinding?)] = [
         ("查询选中文字",.command("D",code:2,extra:.control)),
-        ("显示 / 隐藏桌面",KeyBinding(name:"",keyCode:103,modifiers:0,keyLabel:"F11")),
+        ("显示 / 隐藏桌面",nil),
         ("调度中心",KeyBinding(name:"",keyCode:126,modifiers:UInt64(NSEvent.ModifierFlags.control.rawValue),keyLabel:"↑")),
         ("当前应用窗口",KeyBinding(name:"",keyCode:125,modifiers:UInt64(NSEvent.ModifierFlags.control.rawValue),keyLabel:"↓")),
         ("左侧桌面",KeyBinding(name:"",keyCode:123,modifiers:UInt64(NSEvent.ModifierFlags.control.rawValue),keyLabel:"←")),
         ("右侧桌面",KeyBinding(name:"",keyCode:124,modifiers:UInt64(NSEvent.ModifierFlags.control.rawValue),keyLabel:"→"))]
     private let iconChoices: [(String,String)] = [("自动",""),("键盘","keyboard"),("Command","command"),("星标","star"),("爱心","heart"),("闪电","bolt"),("复制图标","doc.on.doc"),("剪贴板","clipboard"),("剪刀","scissors"),("文件夹","folder"),("网格","square.grid.2x2"),("浏览器","globe"),("搜索","magnifyingglass"),("截图","camera.viewfinder"),("相机","camera"),("锁","lock"),("音乐","music.note"),("播放","play"),("暂停","pause"),("音量","speaker.wave.2"),("亮度","sun.max"),("代码","chevron.left.forwardslash.chevron.right"),("终端","terminal"),("笔","pencil"),("画笔","paintbrush"),("调色板","paintpalette"),("窗口","macwindow"),("全屏","arrow.up.left.and.arrow.down.right"),("返回","arrow.uturn.backward"),("工具","wrench.and.screwdriver"),("时间","clock"),("文件","doc"),("书签","bookmark"),("收件箱","tray"),("咖啡","cup.and.saucer"),("人物","person"),("齿轮","gearshape")] + DialIcons.additions
-    private let presets: [(String, KeyBinding, String)] = [
+    private let presets: [(String, KeyBinding?, String)] = [
         ("复制",.command("C",code:8),"doc.on.doc"),("粘贴",.command("V",code:9),DialIcons.paste),("剪切",.command("X",code:7),"scissors"),
         ("全选",.command("A",code:0),"selection.pin.in.out"),("撤销",.command("Z",code:6),"arrow.uturn.backward"),
         ("截图选区",.command("4",code:21,extra:.shift),"camera.viewfinder"),("锁屏",.command("Q",code:12,extra:.control),"lock"),
         ("查询选中文字",.command("D",code:2,extra:.control),"text.magnifyingglass"),
-        ("显示 / 隐藏桌面",KeyBinding(name:"",keyCode:103,modifiers:0,keyLabel:"F11"),"macwindow"),
+        ("显示 / 隐藏桌面",nil,"macwindow"),
         ("调度中心",KeyBinding(name:"",keyCode:126,modifiers:UInt64(NSEvent.ModifierFlags.control.rawValue),keyLabel:"↑"),"square.grid.2x2"),
         ("当前应用窗口",KeyBinding(name:"",keyCode:125,modifiers:UInt64(NSEvent.ModifierFlags.control.rawValue),keyLabel:"↓"),"macwindow.on.rectangle"),
         ("左侧桌面",KeyBinding(name:"",keyCode:123,modifiers:UInt64(NSEvent.ModifierFlags.control.rawValue),keyLabel:"←"),"arrow.left"),
@@ -85,6 +89,7 @@ final class SettingsView: NSView, NSTextFieldDelegate {
         button("←",x:280,y:446,w:60,action:#selector(moveNodeUp),parent:menuPage)
         button("→",x:346,y:446,w:60,action:#selector(moveNodeDown),parent:menuPage)
         button("音量与亮度手感…",x:0,y:502,w:200,action:#selector(showRingSetup),parent:menuPage)
+        ringLearningStatus.frame = NSRect(x:216,y:509,width:280,height:20); ringLearningStatus.font = .systemFont(ofSize:11); ringLearningStatus.textColor = .secondaryLabelColor; menuPage.addSubview(ringLearningStatus)
         text("名称",x:510,y:8,w:70,parent:menuPage)
         nameField.frame = NSRect(x:580,y:0,width:325,height:30); nameField.delegate = self; nameField.setAccessibilityLabel("所选菜单项名称"); menuPage.addSubview(nameField)
         text("动作",x:510,y:56,w:70,parent:menuPage)
@@ -93,7 +98,7 @@ final class SettingsView: NSView, NSTextFieldDelegate {
         recorder.frame = NSRect(x:580,y:96,width:255,height:32); recorder.onRecord = { [weak self] binding in self?.edit { $0.shortcut = binding } }; menuPage.addSubview(recorder)
         let clear = button("清除",x:842,y:96,w:64,action:#selector(clearShortcut),parent:menuPage)
         examples.frame = NSRect(x:580,y:140,width:325,height:30); examples.addItem(withTitle:"常用快捷键…")
-        for preset in presets { examples.addItem(withTitle:preset.0 + "   " + preset.1.display) }
+        for preset in presets { examples.addItem(withTitle:preset.0 + (preset.1.map { "   " + $0.display } ?? "")) }
         examples.target = self; examples.action = #selector(exampleSelected); menuPage.addSubview(examples)
         shortcutControls = [shortcutTitle,recorder,clear,examples]
         text("图标",x:510,y:207,w:70,parent:menuPage)
@@ -104,6 +109,13 @@ final class SettingsView: NSView, NSTextFieldDelegate {
         button("选择图片…",x:580,y:251,w:155,action:#selector(importIcon),parent:menuPage)
         button("重置图标",x:746,y:251,w:159,action:#selector(resetIcon),parent:menuPage)
         templateIcon.frame = NSRect(x:580,y:297,width:325,height:26); templateIcon.target = self; templateIcon.action = #selector(templateChanged); menuPage.addSubview(templateIcon)
+        hapticEnabled.frame = NSRect(x:510,y:353,width:380,height:26); hapticEnabled.target = self; hapticEnabled.action = #selector(hapticsChanged); menuPage.addSubview(hapticEnabled)
+        text("强度",x:510,y:402,w:60,parent:menuPage)
+        hapticStrength.frame = NSRect(x:580,y:395,width:252,height:28); hapticStrength.target = self; hapticStrength.action = #selector(hapticsChanged); hapticStrength.numberOfTickMarks = 5; hapticStrength.setAccessibilityLabel("圆环震动强度"); menuPage.addSubview(hapticStrength)
+        hapticValue.frame = NSRect(x:846,y:402,width:65,height:24); menuPage.addSubview(hapticValue)
+        button("试震",x:580,y:441,w:120,action:#selector(testHaptics),parent:menuPage)
+        button("设备权限…",x:714,y:441,w:140,action:#selector(hapticPermissions),parent:menuPage)
+        hapticStatus.frame = NSRect(x:510,y:493,width:400,height:36); hapticStatus.font = .systemFont(ofSize:11); hapticStatus.textColor = .secondaryLabelColor; menuPage.addSubview(hapticStatus)
     }
     @objc private func openChildren() {
         ringEditor.showChildren()
@@ -144,6 +156,9 @@ final class SettingsView: NSView, NSTextFieldDelegate {
     func reloadFromStore() {
         reloading = true
         if store.config.item(at:selection) == nil { selection.child = nil }
+        ringLearningStatus.stringValue = store.config.ringWheel.profile.calibrated ? "已学习 · \(store.config.ringWheel.profile.samples) 格":"尚未学习"
+        let zoom = store.config.mouseHabits.adaptation.zoomProfile
+        zoomLearningStatus.stringValue = zoom?.calibrated == true ? "已学习 · \(zoom!.samples) 格 · 应用比例校准 \(store.config.mouseHabits.adaptation.appZoom.count) 个":"尚未学习"
         ringEditor.config = store.config; ringEditor.selection = selection
         reloadInspector(); reloadSystem(); reloadMousePage(); smoothPage?.reload(); reloading = false
     }
@@ -156,12 +171,22 @@ final class SettingsView: NSView, NSTextFieldDelegate {
         for view in shortcutControls { view.isHidden = item.action != .shortcut }
         iconPreview.image = item.iconPNG.flatMap { NSImage(data:$0) } ?? DialIcons.image(named:item.effectiveSymbol)
         select(symbols,value:item.symbol ?? ""); templateIcon.state = item.templateIcon ? .on : .off
+        hapticEnabled.state = store.config.ringHaptics.enabled ? .on:.off
+        hapticStrength.doubleValue = Double(store.config.ringHaptics.intensity); hapticStrength.isEnabled = store.config.ringHaptics.enabled
+        hapticValue.stringValue = "\(store.config.ringHaptics.intensity)%"; hapticStatus.stringValue = controller?.hapticStatus ?? ""
         addButton.isEnabled = store.config.items[selection.root].action == .submenu && store.config.items[selection.root].children.count < 8
         deleteButton.isEnabled = selection.child != nil
         editChildren.isEnabled = store.config.items[selection.root].action == .submenu
     }
 
     private func select(_ popup:NSPopUpButton,value:String) { if let item = popup.itemArray.first(where:{$0.representedObject as? String == value}) { popup.select(item) } }
+    func setHapticStatus(_ text:String) { hapticStatus.stringValue = text }
+    @objc private func hapticsChanged() {
+        store.config.ringHaptics = RingHapticSettings(enabled:hapticEnabled.state == .on,intensity:Int(hapticStrength.doubleValue.rounded()))
+        hapticValue.stringValue = "\(store.config.ringHaptics.intensity)%"; hapticStrength.isEnabled = store.config.ringHaptics.enabled
+    }
+    @objc private func testHaptics() { controller?.testRingHaptics() }
+    @objc private func hapticPermissions() { if let url = URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") { NSWorkspace.shared.open(url) } }
     private func reloadSystem() {
         let c = store.config
         theme.selectItem(at:c.appearance.dark ? 1:0); accent.color = c.appearance.accent
@@ -181,13 +206,16 @@ final class SettingsView: NSView, NSTextFieldDelegate {
         permission.isHidden = allowed
     }
     func controlTextDidChange(_ obj:Notification) { if obj.object as? NSTextField === nameField { edit { $0.name = nameField.stringValue } } }
+    func allowsSmoothScrolling(at point:NSPoint) -> Bool {
+        tabs.selectedSegment == 2 && smoothPage.applicationScrollContains(point)
+    }
     @objc private func tabChanged() { if tabs.selectedSegment != 1 { controller?.cancelMouseDetection() }; cancelRecording(); menuPage.isHidden = tabs.selectedSegment != 0; mousePage.isHidden = tabs.selectedSegment != 1; smoothPage.isHidden = tabs.selectedSegment != 2; systemPage.isHidden = tabs.selectedSegment != 3 }
     @objc private func typeChanged() {
         guard let raw = type.selectedItem?.representedObject as? String,let action = DialAction(rawValue:raw) else{return}
         edit { item in let old = item.action; item.action = action; if item.name == old.title || item.name.isEmpty { item.name = action.title }; if action == .submenu && item.children.isEmpty { item.children = [MenuItem.custom(1),MenuItem.custom(2),MenuItem.custom(3)] } }
     }
     @objc private func clearShortcut() { edit { $0.shortcut = nil } }
-    @objc private func exampleSelected() { guard examples.indexOfSelectedItem > 0 else{return}; let p = presets[examples.indexOfSelectedItem-1]; edit { $0.name = p.0; $0.action = .shortcut; $0.shortcut = p.1; $0.symbol = p.2; $0.iconPNG = nil }; examples.selectItem(at:0) }
+    @objc private func exampleSelected() { guard examples.indexOfSelectedItem > 0 else{return}; let p = presets[examples.indexOfSelectedItem-1]; edit { $0.name = p.0; $0.action = p.1 == nil ? .showDesktop:.shortcut; $0.shortcut = p.1; $0.symbol = p.2; $0.iconPNG = nil }; examples.selectItem(at:0) }
     @objc private func symbolChanged() { let raw = symbols.selectedItem?.representedObject as? String; edit { $0.symbol = raw; $0.iconPNG = nil } }
     @objc private func resetIcon() { edit { $0.symbol = nil; $0.iconPNG = nil; $0.templateIcon = true } }
     @objc private func templateChanged() { edit { $0.templateIcon = templateIcon.state == .on } }
@@ -254,6 +282,7 @@ final class SettingsView: NSView, NSTextFieldDelegate {
         thumbSpaces.frame = NSRect(x:0,y:337,width:450,height:26); thumbSpaces.target = self; thumbSpaces.action = #selector(thumbSpacesChanged); mousePage.addSubview(thumbSpaces)
         spacesReverse.frame = NSRect(x:660,y:337,width:230,height:26); spacesReverse.target = self; spacesReverse.action = #selector(spacesReverseChanged); mousePage.addSubview(spacesReverse)
         button("缩放手感…",x:0,y:398,w:160,action:#selector(showWheelSetup),parent:mousePage)
+        zoomLearningStatus.frame = NSRect(x:180,y:406,width:720,height:22); zoomLearningStatus.font = .systemFont(ofSize:12); zoomLearningStatus.textColor = .secondaryLabelColor; mousePage.addSubview(zoomLearningStatus)
 
     }
     private func reloadMousePage() {
@@ -270,7 +299,7 @@ final class SettingsView: NSView, NSTextFieldDelegate {
         for pair in [("保持原点击","none"),("打开 / 收起圆环","showRing"),("自定义键盘快捷键","custom"),("模拟中键点击","middleClick"),("静音 / 取消静音","mute"),("播放 / 暂停","playPause"),("上一首","previous"),("下一首","next")] {
             mouseClick.addItem(withTitle:pair.0); mouseClick.lastItem?.representedObject = pair.1
         }
-        for (index,preset) in mouseDefaults.enumerated() { mouseClick.addItem(withTitle:preset.0+"   "+preset.1.display); mouseClick.lastItem?.representedObject = "preset:\(index)" }
+        for (index,preset) in mouseDefaults.enumerated() { mouseClick.addItem(withTitle:preset.0+(preset.1.map { "   "+$0.display } ?? "")); mouseClick.lastItem?.representedObject = preset.1 == nil ? DialAction.showDesktop.rawValue : "preset:\(index)" }
         for (title,item) in config.flattened where item.action != .none {
             mouseClick.addItem(withTitle:"圆环 · "+title); mouseClick.lastItem?.representedObject = "item:"+item.id.uuidString
         }
@@ -306,8 +335,10 @@ final class SettingsView: NSView, NSTextFieldDelegate {
         guard let raw = mouseClick.selectedItem?.representedObject as? String else{return}
         let key = String(selectedMouseButton)
         if raw.hasPrefix("preset:"),let index = Int(raw.dropFirst(7)),mouseDefaults.indices.contains(index) {
-            var binding = mouseDefaults[index].1; binding.name = mouseDefaults[index].0
-            store.config.mouseHabits.shortcuts[key] = binding; store.config.mouseBindings[key] = "custom"
+            if var binding = mouseDefaults[index].1 {
+                binding.name = mouseDefaults[index].0
+                store.config.mouseHabits.shortcuts[key] = binding; store.config.mouseBindings[key] = "custom"
+            } else { store.config.mouseBindings[key] = DialAction.showDesktop.rawValue }
         } else { store.config.mouseBindings[key] = raw }
     }
     @objc private func clearMouseShortcut() { store.config.mouseHabits.shortcuts.removeValue(forKey:String(selectedMouseButton)) }
@@ -316,6 +347,7 @@ final class SettingsView: NSView, NSTextFieldDelegate {
     @objc private func mouseMoveChanged() { if let raw = mouseMove.selectedItem?.representedObject as? String,let kind = HeldMoveAction(rawValue:raw) { store.config.mouseHabits.move[String(selectedMouseButton)] = kind; store.config.mouseHabits.activateConfiguredRules(); reloadMoveOptions() } }
     @objc private func thumbSpacesChanged() { store.config.mouseHabits.thumbSpaces = thumbSpaces.state == .on; store.config.mouseHabits.activateConfiguredRules() }
     @objc private func spacesReverseChanged() { store.config.mouseHabits.reverseSpaces = spacesReverse.state == .on }
+    func refreshWheelMode() { smoothPage?.refreshWheelMode() }
     func setMouseStatus(_ value:String) { mouseLiveStatus.stringValue = value }
     @objc private func testMouseClick() { controller?.testMouseClick(selectedMouseButton) }
     @objc private func showWheelSetup() { controller?.showWheelSetup(zoom: true) }

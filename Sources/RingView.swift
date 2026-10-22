@@ -40,6 +40,9 @@ final class RingView: NSView {
     private var images: [UUID: (CGImage?, CGImage?)] = [:]
     private var imageCache: [String: CGImage] = [:]
     private var values: [DialAction: Double] = [:]
+    private var lastHapticID:UUID?
+    var onHapticSelection:((UUID)->Void)?
+    var onHapticClick:(()->Void)?
     private(set) var hovered: Int?
     private(set) var hoveredChild: Int?
     private(set) var openParent: Int?
@@ -165,6 +168,7 @@ final class RingView: NSView {
         NSGraphicsContext.restoreGraphicsState(); return bitmap.cgImage
     }
     func prepare(armedSlot: Int? = nil, armedAction: DialAction? = nil) {
+        lastHapticID = nil
         expansion?.cancel(); expansionToken += 1
         hovered = nil; hoveredChild = nil; openParent = nil; armed = armedSlot; pinnedItem = armedAction.map { MenuItem($0) }; closeHovered = false; status = ""; dragAction = nil
         if let armedSlot { selected = armedSlot }; integrator.reset(); sideIntegrator.reset()
@@ -194,6 +198,10 @@ final class RingView: NSView {
         if changed { integrator.reset(); sideIntegrator.reset(); status = ""; expansion?.cancel(); expansionToken += 1 }
         transaction { updateHighlights() }
         deferringBadge = true
+        let pointedID:UUID?
+        if let parent = openParent,let child = newChild { pointedID = items[parent].children[child].id }
+        else { pointedID = root.map { items[$0].id } }
+        if pointedID != lastHapticID { lastHapticID = pointedID; if let pointedID { onHapticSelection?(pointedID) } }
         if changed { controller?.hoverChanged() }
         deferringBadge = false; updateBadge()
         if let root, openParent != root, changed, items[root].action == .submenu || (openParent != nil && bridge) {
@@ -277,12 +285,14 @@ final class RingView: NSView {
     @objc private func rootPressed(_ sender: NSButton) { activateRoot(sender.tag) }
     @objc private func childPressed(_ sender: NSButton) { activateChild(sender.tag) }
     private func activateRoot(_ slot: Int) {
+        onHapticClick?()
         hovered = slot; hoveredChild = nil; armed = nil; pinnedItem = nil; selected = slot
         if items[slot].action == .submenu { openFolder(slot); return }
         collapseFolder(notify: false); transaction { updateHighlights() }; controller?.performItem(items[slot])
     }
     private func activateChild(_ slot: Int) {
         guard let parent = openParent, items[parent].children.indices.contains(slot) else { return }
+        onHapticClick?()
         hoveredChild = slot; transaction { updateHighlights() }; controller?.performItem(items[parent].children[slot])
     }
     override func updateTrackingAreas() {
@@ -320,7 +330,7 @@ final class RingView: NSView {
     }
     private func processScroll(_ cg: CGEvent, native event: NSEvent, at point: NSPoint, time: Double) {
         // Never treat externally interpolated frames as physical wheel notches.
-        guard cg.getIntegerValueField(.eventSourceUserData) != MouseEvents.sentinel else { return }
+        guard cg.getIntegerValueField(.eventSourceUserData) != MouseEvents.externalSmoothingMarker, cg.getIntegerValueField(.eventSourceUserData) != MouseEvents.sentinel else { return }
         movePointer(to: point)
         guard let action = activeItem?.action, action.adjustable, let config = controller?.store.config else { return }
         let horizontal = abs(event.scrollingDeltaX)>abs(event.scrollingDeltaY)

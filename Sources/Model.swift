@@ -6,7 +6,7 @@ let appID = "local.mousering.preview"
 func clamp(_ x: Double, _ lower: Double = 0, _ upper: Double = 1) -> Double { min(upper, max(lower, x)) }
 
 enum DialAction: String, Codable, CaseIterable, Identifiable {
-    case shortcut, submenu, brightness, volume, mute, previous, playPause, next, showRing, none
+    case shortcut, submenu, brightness, volume, mute, previous, playPause, next, showDesktop, showRing, none
     // Read-only migration values; they never appear as action choices.
     case shortcutA, shortcutB
     var id: String { rawValue }
@@ -20,6 +20,7 @@ enum DialAction: String, Codable, CaseIterable, Identifiable {
         case .previous: return "上一首"
         case .playPause: return "播放 / 暂停"
         case .next: return "下一首"
+        case .showDesktop: return "显示 / 隐藏桌面"
         case .showRing: return "打开圆环"
         case .none: return "不使用"
         }
@@ -34,12 +35,13 @@ enum DialAction: String, Codable, CaseIterable, Identifiable {
         case .previous: return "backward.end.fill"
         case .playPause: return "playpause.fill"
         case .next: return "forward.end.fill"
+        case .showDesktop: return "macwindow"
         case .showRing: return "circle.hexagongrid"
         case .none: return "minus"
         }
     }
     var adjustable: Bool { self == .volume || self == .brightness }
-    static let editable: [DialAction] = [.shortcut, .submenu, .volume, .brightness, .mute, .playPause, .previous, .next, .none]
+    static let editable: [DialAction] = [.shortcut, .submenu, .showDesktop, .volume, .brightness, .mute, .playPause, .previous, .next, .none]
 }
 
 struct KeyBinding: Codable, Equatable {
@@ -209,6 +211,15 @@ struct MouseHabits: Codable, Equatable {
     }
 }
 
+/// Only the old named desktop preset is migrated; a user's recorded F11 stays a shortcut.
+enum DesktopPresetMigration {
+    static func matches(name:String, binding:KeyBinding?) -> Bool {
+        guard let binding, binding.keyCode == 103, binding.modifiers == 0 else { return false }
+        let compact = name.filter { !$0.isWhitespace }.replacingOccurrences(of:"／",with:"/")
+        return compact == "显示/隐藏桌面"
+    }
+}
+
 struct Configuration: Codable, Equatable {
     var schemaVersion = 7
     var items = MenuItem.recommended()
@@ -216,15 +227,18 @@ struct Configuration: Codable, Equatable {
     var mouseHabits = MouseHabits()
     var displayTarget = "pointer"
     var ringWheel = RingWheelSettings()
-    // Preview has a separate preferences domain and independent scroll schema.
+    var learningCount = 10
+    var ringHaptics = RingHapticSettings()
     var smoothScroll = SmoothScrollSettings()
+    var freeWheelSmoothScroll = SmoothScrollSettings()
+    var wheelProfileSelection:WheelProfileSelection = .automatic
     var brightnessControl = BrightnessSettings()
     var step = 0.04
     var reverseScroll = false
     var appearance = RingAppearance()
     init() {}
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, items, mouseBindings, mouseHabits, displayTarget, step, reverseScroll, appearance, ringWheel, smoothScroll, brightnessControl
+        case wheelProfileSelection, freeWheelSmoothScroll, learningCount, ringHaptics, schemaVersion, items, mouseBindings, mouseHabits, displayTarget, step, reverseScroll, appearance, ringWheel, smoothScroll, brightnessControl
         case slots, shortcutA, shortcutB
     }
     init(from decoder: Decoder) throws {
@@ -253,7 +267,11 @@ struct Configuration: Codable, Equatable {
         }
         displayTarget = try c.decodeIfPresent(String.self, forKey: .displayTarget) ?? displayTarget
         ringWheel = try c.decodeIfPresent(RingWheelSettings.self, forKey: .ringWheel) ?? RingWheelSettings(profile: mouseHabits.adaptation.levelProfile ?? mouseHabits.adaptation.vertical, step: mouseHabits.adaptation.levelStep)
-        smoothScroll = (try? c.decode(SmoothScrollSettings.self, forKey: .smoothScroll)) ?? smoothScroll
+        learningCount = try c.decodeIfPresent(Int.self,forKey:.learningCount) ?? 10
+        ringHaptics = try c.decodeIfPresent(RingHapticSettings.self,forKey:.ringHaptics) ?? RingHapticSettings()
+        smoothScroll = (try? c.decode(SmoothScrollSettings.self,forKey:.smoothScroll)) ?? smoothScroll
+        freeWheelSmoothScroll = (try? c.decode(SmoothScrollSettings.self,forKey:.freeWheelSmoothScroll)) ?? smoothScroll
+        wheelProfileSelection = (try? c.decode(WheelProfileSelection.self,forKey:.wheelProfileSelection)) ?? .automatic
         brightnessControl = try c.decodeIfPresent(BrightnessSettings.self, forKey: .brightnessControl) ?? brightnessControl
         step = try c.decodeIfPresent(Double.self, forKey: .step) ?? step
         reverseScroll = try c.decodeIfPresent(Bool.self, forKey: .reverseScroll) ?? reverseScroll
@@ -264,7 +282,10 @@ struct Configuration: Codable, Equatable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(schemaVersion, forKey: .schemaVersion); try c.encode(items, forKey: .items)
         try c.encode(mouseBindings, forKey: .mouseBindings); try c.encode(mouseHabits, forKey: .mouseHabits); try c.encode(displayTarget, forKey: .displayTarget)
+        try c.encode(freeWheelSmoothScroll,forKey:.freeWheelSmoothScroll)
+        try c.encode(wheelProfileSelection,forKey:.wheelProfileSelection)
         try c.encode(smoothScroll, forKey: .smoothScroll); try c.encode(brightnessControl, forKey: .brightnessControl)
+        try c.encode(learningCount,forKey:.learningCount); try c.encode(ringHaptics,forKey:.ringHaptics)
         try c.encode(ringWheel, forKey: .ringWheel); try c.encode(step, forKey: .step)
         try c.encode(reverseScroll, forKey: .reverseScroll); try c.encode(appearance, forKey: .appearance)
     }
@@ -289,6 +310,8 @@ struct Configuration: Codable, Equatable {
         var result = self; result.schemaVersion = 7
         result.mouseHabits = mouseHabits.sanitized()
         result.ringWheel = ringWheel.sanitized()
+        result.learningCount = max(1,min(100,learningCount)); result.ringHaptics = ringHaptics.sanitized()
+        result.freeWheelSmoothScroll = freeWheelSmoothScroll.sanitized()
         result.smoothScroll = smoothScroll.sanitized(); result.brightnessControl = brightnessControl.sanitized()
         result.mouseHabits.adaptation.zoomProfile = mouseHabits.adaptation.zoomProfile ?? (mouseHabits.adaptation.vertical.calibrated ? mouseHabits.adaptation.vertical : nil)
         result.mouseHabits.adaptation.levelProfile = nil
@@ -296,6 +319,10 @@ struct Configuration: Codable, Equatable {
         result.mouseHabits.adaptation.horizontal = WheelProfile()
         result.mouseHabits.zoomModifiers = 0
         result.mouseBindings = mouseBindings.filter { Int($0.key).map { (2...31).contains($0) } ?? false }
+        for (key, binding) in result.mouseHabits.shortcuts where result.mouseBindings[key] == "custom" && DesktopPresetMigration.matches(name:binding.name,binding:binding) {
+            result.mouseBindings[key] = DialAction.showDesktop.rawValue
+            result.mouseHabits.shortcuts.removeValue(forKey:key)
+        }
         result.items = Array(items.prefix(8))
         while result.items.count < 8 { result.items.append(MenuItem(.none)) }
         var ids = Set<UUID>()
@@ -304,6 +331,7 @@ struct Configuration: Codable, Equatable {
             if ids.contains(item.id) { item.id = UUID() }; ids.insert(item.id)
             item.name = String(item.name.prefix(64))
             if item.action == .shortcutA || item.action == .shortcutB { item.action = .shortcut }
+            if item.action == .shortcut && DesktopPresetMigration.matches(name:item.name,binding:item.shortcut) { item.action = .showDesktop; item.shortcut = nil }
             if item.action == .showRing { item.action = .none }
             if depth > 0 && item.action == .submenu { item.action = .shortcut }
             item.children = depth == 0 ? Array(item.children.prefix(8)).map { clean($0, depth: 1) } : []

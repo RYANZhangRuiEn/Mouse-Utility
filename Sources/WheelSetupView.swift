@@ -68,6 +68,23 @@ private final class WheelCanvas:NSView {
 
 private final class WheelFlippedView:NSView { override var isFlipped:Bool { true } }
 
+private final class WheelLearningProgress:NSView {
+    var count = 0 { didSet { needsDisplay = true } }
+    var total = 10 { didSet { needsDisplay = true } }
+    override var isFlipped:Bool { true }
+    override func draw(_ dirtyRect:NSRect) {
+        let columns = min(10,total), rows = (total+columns-1)/columns
+        let gap:CGFloat = 8, width = (bounds.width-CGFloat(columns-1)*gap)/CGFloat(columns)
+        let height = min(CGFloat(12),(bounds.height-CGFloat(rows-1)*4)/CGFloat(rows))
+        for index in 0..<total {
+            let box = NSRect(x:CGFloat(index%columns)*(width+gap),y:CGFloat(index/columns)*(height+4),width:width,height:height)
+            (index<count ? NSColor.controlAccentColor:NSColor.quaternaryLabelColor).setFill()
+            NSBezierPath(roundedRect:box,xRadius:min(height/2,5),yRadius:min(height/2,5)).fill()
+        }
+        setAccessibilityLabel("学习进度 \(count) / \(total) 格")
+    }
+}
+
 /// Fixed-count guidance; detailed software-percentage feedback stays collapsed by default.
 final class WheelSetupView:NSView {
     let store:SettingsStore
@@ -82,7 +99,10 @@ final class WheelSetupView:NSView {
     private let feedback = NSTextField(wrappingLabelWithString:"")
     private let configuredKeys = NSButton(checkboxWithTitle:"按配置的键试用",target:nil,action:nil)
     private let router = MouseRouter()
-    private var wizard = GuidedWheelLearning(), holdingPreview = false
+    private var wizard = AutomaticWheelLearning(), holdingPreview = false
+    private let progress = WheelLearningProgress(), learningCount = NSTextField(string:"10"), countStepper = NSStepper()
+    private var learningIdle:DispatchWorkItem?, savedRound = false
+    private var layoutShift:CGFloat = 0
     override var isFlipped:Bool { true }
     private let zoomScope: Bool
     private var levelIntegrator = LevelWheelInterpreter()
@@ -91,15 +111,25 @@ final class WheelSetupView:NSView {
         self.store = store; self.zoomScope = zoom; super.init(frame:NSRect(x:0,y:0,width:680,height:616))
         wantsLayer = true; layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         label(zoom ? "缩放手感" : "音量与亮度手感",24,18,632,34,24,true)
-        label("先把主滚轮切到有卡点的齿格挡，再跟着做两轮。",24,60,632,26,13)
-        label(zoom ? "圆环外 · 按住鼠标键后滚动" : "圆环内 · 指向音量或亮度后滚动",24,108,410,24,13)
+        label("齿格挡 · 逐格慢滚",24,60,632,26,12)
+        label("每轮",24,105,52,24,13)
+        learningCount.frame = NSRect(x:78,y:100,width:66,height:27); learningCount.alignment = .center
+        learningCount.target = self; learningCount.action = #selector(learningCountChanged); learningCount.setAccessibilityLabel("每轮学习格数"); addSubview(learningCount)
+        countStepper.frame = NSRect(x:151,y:99,width:20,height:29); countStepper.minValue = 1; countStepper.maxValue = 100; countStepper.increment = 1
+        countStepper.target = self; countStepper.action = #selector(learningCountChanged); countStepper.setAccessibilityLabel("学习格数微调"); addSubview(countStepper)
+        label("格",183,105,42,24,13)
         step.frame = NSRect(x:438,y:100,width:218,height:30); step.target = self; step.action = #selector(stepChanged); step.setAccessibilityLabel("每格变化"); addSubview(step)
-        steps.frame = NSRect(x:24,y:151,width:632,height:26); steps.font = .systemFont(ofSize:13,weight:.medium); steps.textColor = .secondaryLabelColor; addSubview(steps)
-        instruction.frame = NSRect(x:24,y:191,width:632,height:32); instruction.font = .systemFont(ofSize:21,weight:.semibold); addSubview(instruction)
-        hint.frame = NSRect(x:24,y:232,width:632,height:32); hint.font = .systemFont(ofSize:12); hint.textColor = .secondaryLabelColor; addSubview(hint)
+        steps.frame = NSRect(x:24,y:148,width:632,height:26); steps.font = .systemFont(ofSize:13,weight:.medium); steps.textColor = .secondaryLabelColor; addSubview(steps)
+        instruction.frame = NSRect(x:24,y:185,width:632,height:32); instruction.font = .systemFont(ofSize:21,weight:.semibold); addSubview(instruction)
+        hint.frame = NSRect(x:24,y:242,width:632,height:24); hint.font = .systemFont(ofSize:12); hint.textColor = .secondaryLabelColor; addSubview(hint)
+        progress.frame = NSRect(x:24,y:219,width:632,height:22); addSubview(progress)
         canvas.receive = { [weak self] in self?.receive($0) }; canvas.receiveButton = { [weak self] event in if let cg = event.cgEvent { self?.receiveButton(cg) } }; addSubview(canvas)
         button(primary,438,450,218,#selector(advance)); button(restart,24,450,126,#selector(restartLearning))
         button(NSButton(title:"重置试用",target:nil,action:nil),164,450,126,#selector(resetPreview))
+        let resetLearning = NSButton(title:"重置学习",target:nil,action:nil)
+        resetLearning.toolTip = zoom ? "清除缩放的滚轮学习和全部应用比例校准；保留音量与亮度学习。" : "清除音量与亮度的滚轮学习；保留缩放学习。"
+        resetLearning.setAccessibilityLabel(zoom ? "重置缩放学习":"重置音量与亮度学习")
+        button(resetLearning,304,450,120,#selector(resetLearningData))
         status.frame = NSRect(x:24,y:501,width:632,height:45); status.font = .systemFont(ofSize:12); status.textColor = .secondaryLabelColor; addSubview(status)
         live.frame = NSRect(x:24,y:550,width:632,height:21); live.font = .monospacedDigitSystemFont(ofSize:12,weight:.medium); addSubview(live)
         more.isHidden = !zoom; more.frame = NSRect(x:24,y:581,width:632,height:25); more.target = self; more.action = #selector(toggleMore); addSubview(more)
@@ -151,6 +181,7 @@ final class WheelSetupView:NSView {
         let s = store.config.mouseHabits.adaptation
         mode.selectItem(at:s.mode == .detent ? 1:0)
         percentages(zoomStep,[1,5,10,15,20,25,50],s.zoomStep)
+        if !wizard.active { learningCount.integerValue = store.config.learningCount; countStepper.integerValue = store.config.learningCount }
         refreshStep(); refreshGuide(); refreshFeedback(); refreshLive()
     }
     private func refreshStep() {
@@ -170,51 +201,77 @@ final class WheelSetupView:NSView {
     }
     @objc private func toggleMore() {
         let expanded = more.state == .on; advanced.isHidden = !expanded
-        setFrameSize(NSSize(width:680,height:expanded ? 968:616))
+        setFrameSize(NSSize(width:680,height:(expanded ? 968:616)+layoutShift))
         if let scroll = enclosingScrollView { scroll.reflectScrolledClipView(scroll.contentView) }
+    }
+    @objc private func learningCountChanged(_ sender:NSControl) {
+        let value = max(1,min(100,sender.integerValue))
+        learningCount.integerValue = value; countStepper.integerValue = value
+        store.config.learningCount = value; refreshGuide()
     }
     @objc private func advance() {
         if wizard.stage == .done { window?.performClose(nil); return }
-        endPreview()
-        if let profile = wizard.advance() {
-            store.backup()
-            if zoomScope { store.config.mouseHabits.adaptation.zoomProfile = profile; store.config.mouseHabits.adaptation.appZoom.removeAll() }
-            else { store.config.ringWheel.profile = profile }
-            canvas.zoom = 1; canvas.level = 0.5; canvas.kind = zoomScope ? .zoom:.volume
-        }
-        refreshGuide(); refreshFeedback(); refreshLive(); window?.makeFirstResponder(canvas)
+        beginLearning()
     }
-    @objc private func restartLearning() { endPreview(); wizard.reset(); _ = wizard.advance(); refreshGuide(); window?.makeFirstResponder(canvas) }
+    private func beginLearning() {
+        endPreview(); learningIdle?.cancel(); savedRound = false
+        store.config.learningCount = max(1,min(100,learningCount.integerValue))
+        wizard.begin(count:store.config.learningCount); canvas.zoom = 1; canvas.level = 0.5
+        refreshGuide(); refreshLive(); window?.makeFirstResponder(canvas)
+    }
+    @objc private func restartLearning() { beginLearning() }
+    func finishLearningBurst(at time:Double) {
+        wizard.idle(time:time); saveAutomaticLearning(); refreshGuide(); refreshLive()
+    }
+    private func saveAutomaticLearning() {
+        guard !savedRound,let profile = wizard.profile else { return }
+        savedRound = true; store.backup()
+        if zoomScope { store.config.mouseHabits.adaptation.zoomProfile = profile; store.config.mouseHabits.adaptation.appZoom.removeAll() }
+        else { store.config.ringWheel.profile = profile }
+        store.flush(); canvas.zoom = 1; canvas.level = 0.5; refreshFeedback()
+    }
+    @objc private func resetLearningData() {
+        learningIdle?.cancel(); savedRound = false
+        endPreview(); wizard.reset(); store.backup()
+        store.config.resetWheelLearning(zoomScope ? .zoom:.levels)
+        store.flush()
+        before.stringValue = "100"; after.stringValue = ""; actualCount.stringValue = "3"
+        resetPreview(); reloadFromStore()
+        status.stringValue = zoomScope ? "缩放学习已重置" : "音量与亮度学习已重置"
+    }
     private func refreshGuide() {
-        scope.isEnabled = !wizard.active; step.isEnabled = !wizard.active; configuredKeys.isEnabled = !wizard.active
-        restart.isHidden = wizard.stage == .ready; primary.isEnabled = !wizard.active || wizard.hasInput
-        switch wizard.stage {
-        case .ready:
-            steps.stringValue = "① 向上 10 格    →    ② 向下 10 格    →    ③ 试用"
-            instruction.stringValue = "跟着做两轮，自动保存"; hint.stringValue = "无需填写格数，也无需计算百分比。"
-            primary.title = "开始学习"; canvas.prompt = "在这里滚动可先试试手感"
-        case .up:
-            steps.stringValue = "① 向上 10 格    →    ② 向下 10 格    →    ③ 试用"
-            instruction.stringValue = "在下面区域，向上滚 10 格"; hint.stringValue = "保持一个方向，一格一格数到 10；滚完再点右下按钮。"
-            primary.title = "向上滚完了"; canvas.prompt = "↑  向上滚 10 格"
-        case .down:
-            steps.stringValue = "✓ 向上完成    →    ② 向下 10 格    →    ③ 试用"
-            instruction.stringValue = "现在向下滚 10 格"; hint.stringValue = "与上一轮方向相反，数到 10 后点右下按钮，即可保存。"
-            primary.title = "向下滚完了"; canvas.prompt = "↓  向下滚 10 格"
-        case .done:
-            steps.stringValue = "✓ 向上完成    →    ✓ 向下完成    →    ③ 试用"
-            instruction.stringValue = "已保存，滚一格试试"
-            hint.stringValue = zoomScope ? "这里显示缩放手感；真实软件仍使用原生触控板捏合。":"预览从 50% 开始。每上滚一格应增加 \(Int((store.config.ringWheel.step*100).rounded())) 个百分点。"
-            primary.title = "完成"; canvas.prompt = nil
+        step.isEnabled = !wizard.active; learningCount.isEnabled = !wizard.active; countStepper.isEnabled = !wizard.active
+        restart.isHidden = wizard.stage == .ready; primary.isEnabled = !wizard.active
+        let total = wizard.active || wizard.stage == .done ? wizard.target:store.config.learningCount
+        progress.total = total; progress.count = wizard.stage == .done ? total:wizard.progress
+        let rows = (total+9)/10
+        let height = CGFloat(rows*10+max(0,rows-1)*4)
+        let shift = max(0,height-22), difference = shift-layoutShift
+        if difference != 0 {
+            for view in subviews where view.frame.minY>=242 { view.frame.origin.y += difference }
+            layoutShift = shift
+            setFrameSize(NSSize(width:680,height:(more.state == .on ? 968:616)+layoutShift))
         }
-        if let failure = wizard.failure { hint.stringValue = failure == .noInput ? "没有收到主滚轮输入。请把指针放在中间区域，滚完 10 格后重试。":"两轮结果不一致。保持齿格挡，按当前箭头方向再滚 10 格，然后点按钮。" }
-        if zoomScope { status.stringValue = "仅保存缩放手感，不影响圆环内的音量和亮度。" }
-        else if store.config.ringWheel.profile.calibrated { status.stringValue = "音量和亮度已学习：每格 \(Int((store.config.ringWheel.step*100).rounded())) 个百分点。缩放设置保留。" }
-        else { status.stringValue = "尚未学习：已启用防跳变保护，快速输入可能合并。完成两轮后按实际齿格调节；缩放设置保留。" }
-        canvas.needsDisplay = true
+        progress.frame.size.height = height
+        steps.stringValue = wizard.stage == .down || wizard.stage == .done ? "✓ 向上 \(total) 格  →  向下 \(wizard.stage == .done ? total:wizard.progress)/\(total) 格" : "向上 \(wizard.progress)/\(total) 格  →  向下 \(total) 格"
+        hint.stringValue = ""
+        switch wizard.stage {
+        case .ready: instruction.stringValue = "准备学习"; primary.title = "开始学习"; canvas.prompt = "在这里试用缩放与调节"
+        case .up: instruction.stringValue = "↑ 向上滚动"; primary.title = "学习中…"; canvas.prompt = "↑"; hint.stringValue = wizard.message
+        case .down: instruction.stringValue = "↓ 反向滚动"; primary.title = "学习中…"; canvas.prompt = "↓"; hint.stringValue = wizard.message
+        case .done: instruction.stringValue = "学习完成"; primary.title = "完成"; canvas.prompt = nil
+        }
+        let profile = zoomScope ? store.config.mouseHabits.adaptation.zoomProfile:store.config.ringWheel.profile
+        if let profile,profile.calibrated {
+            let date = profile.learnedAt.map { date -> String in let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"; return " · "+f.string(from:date) } ?? ""
+            let perStep = zoomScope ? store.config.mouseHabits.adaptation.zoomStep:store.config.ringWheel.step
+            status.stringValue = "已学习 · \(profile.samples) 格 · 每格 \(Int((perStep*100).rounded()))%"+date
+            if zoomScope { status.stringValue += "\n应用比例校准：\(store.config.mouseHabits.adaptation.appZoom.count) 个" }
+        } else { status.stringValue = "尚未学习" }
+        canvas.needsDisplay = true; progress.needsDisplay = true
     }
     @objc private func resetPreview() { endPreview(); canvas.zoom = 1; canvas.offset = 0; canvas.level = 0.5; canvas.desktop = 3; canvas.needsDisplay = true; refreshLive() }
-    private func refreshLive() { live.stringValue = wizard.active ? "学习时不会改变系统音量或亮度":"本地试用 · \(canvas.descriptionText)" }
+    private func refreshLive() { live.stringValue = wizard.active ? "\(wizard.stage == .up ? "向上":"向下") \(wizard.progress) / \(wizard.target) 格":canvas.descriptionText }
     @objc private func effectChanged() { endPreview(); canvas.kind = HeldWheelAction(rawValue:effect.selectedItem?.representedObject as? String ?? "volume") ?? .volume; canvas.prompt = nil; resetPreview() }
     @objc private func configuredKeysChanged() { resetPreview(); canvas.prompt = nil; effect.isEnabled = configuredKeys.state != .on }
     @objc private func targetChanged() { refreshFeedback() }
@@ -232,7 +289,7 @@ final class WheelSetupView:NSView {
         let options = NSWorkspace.OpenConfiguration(); options.activates = true; NSWorkspace.shared.open([page],withApplicationAt:chrome,configuration:options)
     }
     private func endPreview() { router.reset(); levelIntegrator.reset(); holdingPreview = false }
-    func stop() { endPreview(); wizard.reset() }
+    func stop() { learningIdle?.cancel(); endPreview(); wizard.reset() }
     private func previewButton(_ type:CGEventType) -> CGEvent {
         let event = CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:.zero,mouseButton:.center)!
         event.setIntegerValueField(.mouseEventButtonNumber,value:31); return event
@@ -244,6 +301,10 @@ final class WheelSetupView:NSView {
         _ = router.handle(event.type,event,config:store.config); refreshLive()
     }
     func receive(_ event:NSEvent) { if let cg = event.cgEvent { receive(cg,time:event.timestamp) } }
+    func canvasContains(_ point:NSPoint) -> Bool {
+        guard let window else { return false }
+        return canvas.bounds.contains(canvas.convert(window.convertPoint(fromScreen:point),from:nil))
+    }
     func receiveHardwareScroll(_ cg: CGEvent) -> Bool {
         guard let window else { return false }
         let point = canvas.convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
@@ -251,8 +312,19 @@ final class WheelSetupView:NSView {
         receive(cg, time: ProcessInfo.processInfo.systemUptime); return true
     }
     func receive(_ event:CGEvent,time:Double) {
+        if event.getIntegerValueField(.eventSourceUserData) == MouseEvents.externalSmoothingMarker {
+            status.stringValue = "输入已经被其他工具平滑，请先暂停该工具再学习。"; return
+        }
         let side = abs(MouseEvents.physicalDelta(event,horizontal:true))>abs(MouseEvents.physicalDelta(event))
-        if wizard.active { if !side { wizard.record(WheelSample(event)) }; refreshGuide(); refreshLive(); return }
+        if wizard.active {
+            if !side {
+                wizard.record(WheelSample(event),time:time); saveAutomaticLearning()
+                learningIdle?.cancel()
+                let item = DispatchWorkItem { [weak self] in self?.finishLearningBurst(at:time+0.10) }
+                learningIdle = item; DispatchQueue.main.asyncAfter(deadline:.now()+0.10,execute:item)
+            }
+            refreshGuide(); refreshLive(); return
+        }
         guard WheelSample(event).nonzero || WheelSample(event,horizontal:true).nonzero else{return}
         canvas.prompt = nil
         if configuredKeys.state == .on {
@@ -271,5 +343,5 @@ final class WheelSetupView:NSView {
         if !holdingPreview { _ = router.handle(.otherMouseDown,previewButton(.otherMouseDown),config:config); holdingPreview = true }
         _ = router.handle(.scrollWheel,event,config:config,time:time); refreshLive()
     }
-    deinit { router.reset() }
+    deinit { learningIdle?.cancel(); router.reset() }
 }

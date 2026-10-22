@@ -34,7 +34,23 @@ enum MouseOutput {
 /// Event construction is separate from posting so conversion can be tested without touching other apps.
 enum MouseEvents {
     static let sentinel: Int64 = 0x4F524249544D
-    static func mark(_ event: CGEvent) -> CGEvent { event.setIntegerValueField(.eventSourceUserData,value:sentinel); return event }
+    static let externalSmoothingMarker:Int64 = 0x4D4F53534D4F4F54
+    // Converted physical wheel: skip button arbitration, then visit the smoothing tap exactly once.
+    static let heldHorizontalMarker: Int64 = 0x4F5242484F52
+    static func isRouted(_ event:CGEvent) -> Bool {
+        let marker = event.getIntegerValueField(.eventSourceUserData)
+        return marker == sentinel || marker == heldHorizontalMarker
+    }
+    @discardableResult static func mark(_ event:CGEvent,as marker:Int64 = sentinel) -> CGEvent {
+        event.setIntegerValueField(.eventSourceUserData,value:marker)
+        // On macOS 27 an event with existing source data may ignore an overwrite.
+        // Replacing its source snapshot updates the tag without rebuilding its native payload.
+        if event.getIntegerValueField(.eventSourceUserData) != marker,
+           let source = CGEventSource(event:event) ?? CGEventSource(stateID:.privateState) {
+            source.userData = marker; event.setSource(source)
+        }
+        return event
+    }
     // Gesture format verified against ScrollToZoom (MIT); see THIRD_PARTY_NOTICES.md.
     static func gesture(rotation: Bool, value: Double, phase: CGGesturePhase, at location: CGPoint, basedOn reference:CGEvent? = nil) -> CGEvent? {
         guard value.isFinite, let event = CGEvent(source:reference.flatMap { CGEventSource(event:$0) } ?? CGEventSource(stateID:.hidSystemState)),
@@ -75,7 +91,7 @@ enum MouseEvents {
         }
         event.setIntegerValueField(.scrollWheelEventIsContinuous,value:precise ? 1:0)
         for field:CGEventField in [.scrollWheelEventScrollPhase,.scrollWheelEventMomentumPhase,.scrollWheelEventScrollCount,CGEventField(rawValue:137)!] { event.setIntegerValueField(field,value:original.getIntegerValueField(field)) }
-        return mark(event)
+        return mark(event,as:heldHorizontalMarker)
     }
     static func vertical(from original:CGEvent) -> CGEvent? {
         guard let event = original.copy() else{return nil}
@@ -149,6 +165,7 @@ final class MouseRouter {
     private var detectingButton: Int?
     private var suppressedReleases = Set<Int>()
     var detecting = false
+    private(set) var forwardedScrollToSmoother = false
     func reset() {
         suppressedReleases.formUnion(presses.keys)
         if let detectingButton { suppressedReleases.insert(detectingButton) }
@@ -243,7 +260,8 @@ final class MouseRouter {
     }
     /// true means the original event has been consumed. All replayed events carry a loop-prevention marker.
     func handle(_ type:CGEventType,_ event:CGEvent,config:Configuration,bypass:Bool = false,time:Double = ProcessInfo.processInfo.systemUptime) -> Bool {
-        guard event.getIntegerValueField(.eventSourceUserData) != MouseEvents.sentinel else { return false }
+        forwardedScrollToSmoother = false
+        guard !MouseEvents.isRouted(event) else { return false }
         let button = Int(event.getIntegerValueField(.mouseEventButtonNumber))
         if type == .otherMouseUp, suppressedReleases.remove(button) != nil { return true }
         if type == .otherMouseDragged, suppressedReleases.contains(button) { return true }
@@ -339,7 +357,10 @@ final class MouseRouter {
             suppressMomentumUntil = time+0.25
             switch mode {
             case .none: break
-            case .horizontal: emit([MouseEvents.horizontal(from:event,reverse:reverse)])
+            case .horizontal:
+                let converted = MouseEvents.horizontal(from:event,reverse:reverse)
+                forwardedScrollToSmoother = converted != nil
+                emit([converted])
             case .spaces: spaces(steps:motion.steps,time:time,reverse:habits.reverseSpaces != reverse)
             case .zoom:
                 let sign = (habits.reverseZoom ? -1.0:1.0)*wheelSign
@@ -373,120 +394,126 @@ final class MouseRouter {
     deinit { zoomTimer?.cancel(); idle?.cancel(); startupGesture?.cancel(); desktopTask?.cancel() }
 }
 
+
 final class MouseInputController {
-    let router = MouseRouter()
-    let smoother = SmoothScrollEngine()
-    var foregroundPID: pid_t = 0
-    var onAction: ((String)->Void)?
-    var onShortcut: ((KeyBinding)->Void)?
-    var onDetected: ((Int)->Void)?
-    var onLevel: ((DialAction,Double)->Void)?
-    var directScroll: ((CGEvent) -> Bool)?
-    var localPractice: ()->Bool = { false }
-    var bypass: (CGEventType)->Bool = { _ in false }
-    var onStatus: ((String)->Void)?
-    private var currentProxy: CGEventTapProxy?
-    private var lastStatusTime = 0.0
+    static let eventTapLocation:CGEventTapLocation = .cgSessionEventTap
+    let router = MouseRouter(), smoother = SmoothScrollEngine()
+    private lazy var scrollTap = ScrollRoutingTap(engine:smoother)
+    var foregroundPID:pid_t = 0
+    var onAction:((String)->Void)?, onShortcut:((KeyBinding)->Void)?, onDetected:((Int)->Void)?
+    var onLevel:((DialAction,Double)->Void)?
+    var directScroll:((CGEvent)->Bool)?
+    var localPractice:()->Bool = { false }
+    var bypass:(CGEventType)->Bool = { _ in false }
+    var bypassScrolling:(CGEvent)->Bool = { _ in false }
+    var onStatus:((String)->Void)?
+    private var tap:CFMachPort?, source:CFRunLoopSource?
+    private var currentProxy:CGEventTapProxy?
+    var postRoutedEvent:(CGEvent,CGEventTapProxy?)->Void = { event,proxy in
+        if let proxy { event.tapPostEvent(proxy) } else { event.post(tap:.cgSessionEventTap) }
+    }
+    private var signature = Data(), lastStatus = -TimeInterval.infinity
+    private var detectionRequested = false, detectionTimeout:DispatchWorkItem?
+    private var externallySmoothed = false
+    private var observedWheelMode:MasterWheelMode?
+    private(set) var activeWheelMode:MasterWheelMode = .ratchet
     var config = Configuration()
-    private var tap: CFMachPort?
-    private var source: CFRunLoopSource?
-    private var signature = Data()
-    private var detectionTimeout: DispatchWorkItem?
-    private var detectionRequested = false
     init() {
-        smoother.post = { event, pid in guard InputSender.trusted, !RecorderButton.isCapturing else { return }; event.postToPid(pid) }
+        smoother.mayPost = { InputSender.trusted }
+        smoother.post = { event,pid in if !RecorderButton.isCapturing { event.post(tap:.cgSessionEventTap) } }
+        scrollTap.bypass = { [weak self] event in self?.bypassScrolling(event) ?? true }
         router.output = { [weak self] output in
+            guard let self else { return }
             switch output {
-            case .action(let value): self?.onAction?(value)
-            case .shortcut(let key): self?.onShortcut?(key)
-            case .events(let events):
-                for event in events {
-                    if let proxy = self?.currentProxy { event.tapPostEvent(proxy) }
-                    else { event.post(tap:.cgSessionEventTap) }
-                }
-            case .level(let action,let delta): self?.onLevel?(action,delta)
-            case .detected(let button):
-                self?.detectionTimeout?.cancel(); self?.detectionRequested = false
-                DispatchQueue.main.async { self?.onDetected?(button); self?.configure(self?.config ?? Configuration(),force:true) }
+            case .action(let raw):self.onAction?(raw)
+            case .shortcut(let key):self.onShortcut?(key)
+            case .level(let kind,let delta):self.onLevel?(kind,delta)
+            case .events(let events):events.forEach { self.postRoutedEvent($0,self.currentProxy) }
+            case .detected(let number):
+                self.detectionTimeout?.cancel(); self.detectionRequested = false
+                DispatchQueue.main.async { self.onDetected?(number); _ = self.configure(self.config,force:true) }
             }
         }
+    }
+    func setWheelMode(_ mode:MasterWheelMode?) {
+        observedWheelMode = mode
+        let mode = config.wheelProfileSelection.resolve(observedWheelMode)
+        guard mode != activeWheelMode else { return }; activeWheelMode = mode
+        smoother.configure(config.scrolling(for:mode)); if tap != nil { _ = updateScrollTap() }
+    }
+    private var required:Bool { config.mouseHabits.enabled || config.mouseBindings.values.contains { $0 != "none" } || detectionRequested || config.needsSmoothListening }
+    private func updateScrollTap() -> Bool {
+        guard !externallySmoothed,config.scrolling(for:activeWheelMode).needsListening else { scrollTap.stop(); return true }
+        let success = scrollTap.start(); if !success { onStatus?("平滑监听未就绪 · 保留系统滚动") }; return success
     }
     @discardableResult func configure(_ config:Configuration,force:Bool = false) -> Bool {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        let next = (try? encoder.encode(config.mouseHabits)) ?? Data()
-        let bindingData = (try? encoder.encode(config.mouseBindings)) ?? Data()
-        let scrollData = (try? encoder.encode(config.smoothScroll)) ?? Data()
-        let combined = next + bindingData + scrollData
-        smoother.configure(config.smoothScroll)
-        self.config = config
-        if !force, combined == signature, tap != nil { return true }
-        stop(cancelDetection:false); signature = combined
-        let active = config.mouseHabits.enabled || config.mouseBindings.values.contains { $0 != "none" } || detectionRequested || config.smoothScroll.needsListening
-        guard active else { onStatus?("监听未启用：尚未配置鼠标动作"); return true }
-        guard InputSender.trusted else { onStatus?("需要辅助功能授权，当前尚未监听"); return false }
+        let baseSignature = ((try? encoder.encode(config.mouseHabits)) ?? Data()) + ((try? encoder.encode(config.mouseBindings)) ?? Data()) + ((try? encoder.encode(config.smoothScroll)) ?? Data()) + ((try? encoder.encode(config.freeWheelSmoothScroll)) ?? Data())
+        let next = baseSignature + ((try? encoder.encode(config.wheelProfileSelection)) ?? Data())
+        let changed = signature != next; signature = next; self.config = config
+        externallySmoothed = NSRunningApplication.runningApplications(withBundleIdentifier:"com.caldis.Mos").contains { !$0.isTerminated }
+        activeWheelMode = config.wheelProfileSelection.resolve(observedWheelMode)
+        smoother.configure(config.scrolling(for:activeWheelMode))
+        guard required else { stop(cancelDetection:false); return true }
+        guard InputSender.trusted else { stop(cancelDetection:false); onStatus?("需要辅助功能授权，当前尚未监听"); return false }
+        if !force,let tap,CGEvent.tapIsEnabled(tap:tap) { if changed { router.reset() }; return updateScrollTap() }
+        stop(cancelDetection:false)
         let types:[CGEventType] = [.otherMouseDown,.otherMouseUp,.otherMouseDragged,.scrollWheel,.flagsChanged,.keyDown,.keyUp,.leftMouseDown,.rightMouseDown]
-        let mask = types.reduce(CGEventMask(0)) { $0 | CGEventMask(1) << $1.rawValue }
+        let mask = types.reduce(CGEventMask(0)) { $0 | CGEventMask(1)<<$1.rawValue }
         let callback:CGEventTapCallBack = { proxy,type,event,context in
             guard let context else { return Unmanaged.passUnretained(event) }
-            let input = Unmanaged<MouseInputController>.fromOpaque(context).takeUnretainedValue()
+            let owner = Unmanaged<MouseInputController>.fromOpaque(context).takeUnretainedValue()
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                input.router.reset(); input.smoother.reset()
-                if InputSender.trusted, let tap = input.tap { CGEvent.tapEnable(tap:tap,enable:true) }
+                owner.router.reset(); owner.smoother.reset()
+                if InputSender.trusted,let tap = owner.tap { CGEvent.tapEnable(tap:tap,enable:true) }
                 return Unmanaged.passUnretained(event)
             }
-            input.currentProxy = proxy
-            defer { input.currentProxy = nil }
-            if type == .scrollWheel, event.getIntegerValueField(.eventSourceUserData) != MouseEvents.sentinel, !RecorderButton.isCapturing, input.directScroll?(event) == true { input.smoother.reset(); input.router.reset(); return nil }
-            if input.localPractice() { input.router.reset(); input.smoother.reset(); return Unmanaged.passUnretained(event) }
-            let bypass = input.bypass(type) && !input.router.detecting
-            if bypass { input.smoother.reset(); input.smoother.releaseKeys() }
-            else { input.smoother.observe(type,event) }
-            var consumed = input.router.handle(type,event,config:input.config,bypass:bypass)
-            if type == .scrollWheel {
-                if consumed { input.smoother.reset() }
-                else if !bypass { consumed = input.smoother.consume(event, foregroundPID: input.foregroundPID) }
-            }
-            let now = ProcessInfo.processInfo.systemUptime
-            if type == .otherMouseDown {
-                input.onStatus?("收到："+MouseButtonIdentity.name(Int(event.getIntegerValueField(.mouseEventButtonNumber)))+(bypass ? " · 录制/界面操作中":""))
-            } else if type == .scrollWheel, now-input.lastStatusTime > 0.3 {
-                input.lastStatusTime = now
-                let x = MouseEvents.physicalDelta(event,horizontal:true), y = MouseEvents.physicalDelta(event)
-                let label = abs(x)>abs(y) ? "横向滚轮":"主滚轮"
-                input.onStatus?("收到："+label+(consumed ? " · 已转换" : " · 普通滚动"))
-            }
-            return consumed ? nil:Unmanaged.passUnretained(event)
+            return owner.handleInput(type,event,proxy:proxy) ? nil:Unmanaged.passUnretained(event)
         }
-        tap = CGEvent.tapCreate(tap:.cgSessionEventTap,place:.headInsertEventTap,options:.defaultTap,eventsOfInterest:mask,
-                               callback:callback,userInfo:Unmanaged.passUnretained(self).toOpaque())
+        tap = CGEvent.tapCreate(tap:Self.eventTapLocation,place:.headInsertEventTap,options:.defaultTap,eventsOfInterest:mask,callback:callback,userInfo:Unmanaged.passUnretained(self).toOpaque())
         if let tap { source = CFMachPortCreateRunLoopSource(nil,tap,0); CFRunLoopAddSource(CFRunLoopGetMain(),source,.commonModes); CGEvent.tapEnable(tap:tap,enable:true) }
         router.detecting = detectionRequested
-        onStatus?(tap != nil ? (config.mouseHabits.enabled ? "监听已开启，等待鼠标输入":"单击映射已开启；滚轮手势已暂停"):"监听启动失败，请重新授权辅助功能后打开")
-        return tap != nil
+        onStatus?(tap == nil ? "鼠标监听未就绪":"鼠标监听已开启")
+        return tap != nil && updateScrollTap()
     }
-    @discardableResult func detect(timeout: @escaping ()->Void) -> Bool {
+    @discardableResult func handleInput(_ type:CGEventType,_ event:CGEvent,proxy:CGEventTapProxy? = nil) -> Bool {
+        currentProxy = proxy; defer { currentProxy = nil }
+        guard !MouseEvents.isRouted(event),event.getIntegerValueField(.eventSourceUserData) != MouseEvents.externalSmoothingMarker else { return false }
+        if type == .scrollWheel,!RecorderButton.isCapturing,directScroll?(event) == true { smoother.reset(); router.reset(); return true }
+        if localPractice() { router.reset(); smoother.reset(); return false }
+        let bypassed = bypass(type) && !router.detecting
+        if RecorderButton.isCapturing { smoother.reset(); smoother.releaseKeys() } else { smoother.observe(type,event) }
+        let used = router.handle(type,event,config:config,bypass:bypassed)
+        if used && type == .scrollWheel && !router.forwardedScrollToSmoother { smoother.reset() }
+        let now = ProcessInfo.processInfo.systemUptime
+        if type == .otherMouseDown { onStatus?("收到："+MouseButtonIdentity.name(Int(event.getIntegerValueField(.mouseEventButtonNumber)))) }
+        else if type == .scrollWheel,now-lastStatus>0.3 { lastStatus = now; onStatus?(used ? "收到滚轮 · 已转换":"收到滚轮") }
+        return used
+    }
+    @discardableResult func detect(timeout:@escaping ()->Void) -> Bool {
         guard InputSender.trusted else { return false }
-        detectionTimeout?.cancel(); detectionTimeout = nil; detectionRequested = true
+        detectionTimeout?.cancel(); detectionRequested = true
         guard configure(config,force:true) else { detectionRequested = false; return false }
-        let task = DispatchWorkItem { [weak self] in
-            guard let self else { return }; self.detectionRequested = false; self.router.reset(); timeout(); self.configure(self.config,force:true)
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self else { return }; self.detectionRequested = false; self.router.reset(); timeout(); _ = self.configure(self.config,force:true)
         }
-        detectionTimeout = task; DispatchQueue.main.asyncAfter(deadline:.now()+8,execute:task)
-        return true
+        detectionTimeout = deadline; DispatchQueue.main.asyncAfter(deadline:.now()+8,execute:deadline); return true
     }
+    func cancelDetection() { if detectionRequested { detectionRequested = false; _ = configure(config,force:true) } }
     func resetScrolling() { smoother.reset() }
-    func refreshExternalApps() { _ = configure(config, force: true) }
-    func cancelDetection() {
-        guard detectionRequested else { return }
-        detectionRequested = false; _ = configure(config,force:true)
+    func refreshExternalApps() { refreshRuntimeState() }
+    func refreshRuntimeState() {
+        let other = NSRunningApplication.runningApplications(withBundleIdentifier:"com.caldis.Mos").contains { !$0.isTerminated }
+        let lostGestureTap = tap.map { !CGEvent.tapIsEnabled(tap:$0) } ?? true
+        let lostScrollTap = !other && config.scrolling(for:activeWheelMode).needsListening && !scrollTap.enabled
+        if other != externallySmoothed || required && InputSender.trusted && (lostGestureTap || lostScrollTap) { _ = configure(config,force:true) }
     }
     func stop(cancelDetection:Bool = true) {
         if cancelDetection { detectionRequested = false }
         if !detectionRequested { detectionTimeout?.cancel(); detectionTimeout = nil }
-        router.reset(); smoother.reset(); smoother.releaseKeys()
+        scrollTap.stop(); router.reset(); smoother.reset(); smoother.releaseKeys()
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(),source,.commonModes) }
-        if let tap { CFMachPortInvalidate(tap) }
-        source = nil; tap = nil
+        if let tap { CFMachPortInvalidate(tap) }; source = nil; tap = nil
     }
     deinit { stop() }
 }

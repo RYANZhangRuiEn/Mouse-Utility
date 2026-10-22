@@ -15,7 +15,9 @@ struct WheelProfile:Codable,Equatable {
     var samples = 0
     var variation = 0.0
     var source:String? = nil
-    var calibrated:Bool { samples >= 8 && !units.isEmpty }
+    var learnedAt:Date? = nil
+    var upNotches:Int? = nil, downNotches:Int? = nil
+    var calibrated:Bool { !units.isEmpty && (samples >= 8 || ((upNotches ?? 0)>0 && (downNotches ?? 0)>0)) }
     func sanitized() -> Self {
         var result = self
         result.units = units.filter { ["raw","point","fixed","line"].contains($0.key) && $0.value.isFinite && $0.value >= 0.00001 && $0.value <= 1_000_000 }
@@ -309,5 +311,81 @@ struct GuidedWheelLearning {
         case .done: break
         }
         return nil
+    }
+}
+
+enum WheelLearningScope { case zoom, levels }
+extension Configuration {
+    mutating func resetWheelLearning(_ scope:WheelLearningScope) {
+        switch scope {
+        case .zoom:
+            mouseHabits.adaptation.zoomProfile = nil
+            mouseHabits.adaptation.appZoom.removeAll()
+            // Legacy fallback must be empty too, or export/sanitization revives deleted measurements.
+            mouseHabits.adaptation.vertical = WheelProfile()
+            mouseHabits.adaptation.horizontal = WheelProfile()
+        case .levels:
+            ringWheel.profile = WheelProfile()
+            mouseHabits.adaptation.levelProfile = nil
+        }
+    }
+}
+
+/// Counts isolated detent bursts before the smooth engine creates frames. Short split reports
+/// form one detent; integer multiples may represent a small burst of consecutive detents.
+/// New wheels bootstrap from the first slow detent, so the guide explicitly requests ratchet mode.
+struct AutomaticWheelLearning {
+    enum Stage { case ready, up, down, done }
+    private(set) var stage:Stage = .ready
+    private(set) var target = 10, progress = 0
+    private(set) var message = ""
+    private(set) var profile:WheelProfile?
+    private var learner = CountedWheelLearner()
+    private var burst:[String:Double] = [:]
+    private var source:String?, firstSign = 0.0, unit = 0.0
+    private var lastTime = -Double.infinity
+    var active:Bool { stage == .up || stage == .down }
+    mutating func begin(count:Int) { self = Self(); target = max(1,min(100,count)); stage = .up; learner.begin() }
+    mutating func reset() { self = Self() }
+    mutating func record(_ sample:WheelSample,time:Double) {
+        guard active,!sample.momentum,sample.nonzero,time.isFinite else { return }
+        if time-lastTime>=0.085 { flushBurst() }
+        guard active else { return }
+        if source == nil { source = ["raw","fixed","line","point"].first { sample.values[$0] != nil } }
+        guard let source,let value = sample.values[source],value != 0 else { return }
+        let sign = value>0 ? 1.0:-1.0
+        if firstSign == 0 { firstSign = sign }
+        let expected = stage == .up ? firstSign:-firstSign
+        if sign != expected {
+            // Finish a last pending upward detent before accepting the first downward one.
+            if !burst.isEmpty { flushBurst() }
+            guard active,sign == (stage == .up ? firstSign:-firstSign) else { message = "请反向滚动"; return }
+        }
+        message = ""; lastTime = time
+        for (key,v) in sample.values { burst[key,default:0] += v }
+    }
+    mutating func idle(time:Double) { if active,time-lastTime>=0.085 { flushBurst() } }
+    private mutating func flushBurst() {
+        guard active,let source,let mass = burst[source],mass != 0 else { burst.removeAll(); return }
+        let values = burst; burst.removeAll()
+        let expected = stage == .up ? firstSign:-firstSign
+        guard mass*expected>0 else { return }
+        if unit == 0 { unit = abs(mass) }
+        let ratio = abs(mass)/unit
+        // Incomplete fragments are retained, never rounded into a full notch.
+        guard ratio>=0.7 else { burst = values; return }
+        let count = max(1,Int(ratio.rounded()))
+        guard count<=12,abs(ratio-Double(count))<=0.35 else { message = "请逐格慢滚"; return }
+        let accepted = min(count,target-progress),fraction = Double(accepted)/Double(count)
+        learner.record(WheelSample(values:values.mapValues { $0*fraction }))
+        progress += accepted
+        guard progress == target else { return }
+        var candidate = learner
+        guard candidate.finish(physicalCount:target) else { progress = 0; learner.begin(); message = "请重试本轮"; return }
+        if stage == .up { learner = candidate; stage = .down; progress = 0; message = "请向下滚动" }
+        else if var learned = candidate.proposal {
+            learned.learnedAt = Date(); learned.upNotches = target; learned.downNotches = target
+            profile = learned; learner = candidate; stage = .done; message = "已保存"
+        } else { progress = 0; learner.begin(); message = "两轮不一致，请重试向下这一轮" }
     }
 }

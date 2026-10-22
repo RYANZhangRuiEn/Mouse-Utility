@@ -2,7 +2,7 @@ import AppKit
 import Carbon
 import Combine
 
-final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, ObservableObject {
+final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, ObservableObject {
     let store: SettingsStore
     let audio = AudioController()
     let brightness = BrightnessController()
@@ -11,8 +11,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
     var ring: RingView!
     private var statusItem: NSStatusItem!
     private var settingsWindow: NSWindow?
+    private var aboutWindow: NSWindow?
+    private var updateWindow: NSPanel?
+    private let updatePreferences: UpdatePreferences
+    private lazy var updateChecker = ReleaseUpdateChecker(preferences:updatePreferences)
+    var desktopController = DesktopController()
     private var settingsView: SettingsView?
     private let mouseInput = MouseInputController()
+    private let haptics = MasterMouseController()
+    private var runtimeStarted = false
+    var hapticStatus:String { haptics.status }
+    var wheelMode:MasterWheelMode? { haptics.wheelMode }
     private var mouseInputReady = false
     private var mouseStatus = ""
     private var probeWindow:NSWindow?
@@ -32,12 +41,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
     private var explicitExit = false
     private var clickShields: [NSWindow] = []
 
-    init(store: SettingsStore = SettingsStore()) { self.store = store; super.init() }
+    init(store: SettingsStore = SettingsStore(), updatePreferences: UpdatePreferences = UpdatePreferences()) {
+        self.store = store; self.updatePreferences = updatePreferences; super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        runtimeStarted = true
         NSApp.setActivationPolicy(.accessory)
+        haptics.onStatus = { [weak self] text in self?.settingsView?.setHapticStatus(text) }
+        haptics.onWheelMode = { [weak self] mode in
+            guard let self,self.runtimeStarted else { return }
+            self.mouseInput.setWheelMode(mode); self.settingsView?.refreshWheelMode()
+        }
         makeMainMenu()
         makePanel(); makeMenu()
+        if !preview { haptics.start(); haptics.configure(store.config.ringHaptics) }
         mouseInput.onAction = { [weak self] value in DispatchQueue.main.async { self?.performMouseBinding(value) } }
         mouseInput.onShortcut = { [weak self] key in
             guard let self, !self.preview, !RecorderButton.isCapturing else { return }
@@ -50,12 +68,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
             guard let self else { return false }
             if self.panel?.isVisible == true { self.ring.hardwareScroll(event); return true }
             if NSApp.isActive, let window = self.probeWindow, window.isVisible,
+               NSWindow.windowNumber(at:NSEvent.mouseLocation,belowWindowWithWindowNumber:0) == window.windowNumber,
                let setup = (window.contentView as? NSScrollView)?.documentView as? WheelSetupView { return setup.receiveHardwareScroll(event) }
             return false
         }
         mouseInput.localPractice = { [weak self] in
             guard let window = self?.probeWindow else{return false}
-            return NSApp.isActive && window.isVisible && window.frame.contains(NSEvent.mouseLocation)
+            guard NSApp.isActive,window.isVisible,NSWindow.windowNumber(at:NSEvent.mouseLocation,belowWindowWithWindowNumber:0) == window.windowNumber,let view = (window.contentView as? NSScrollView)?.documentView as? WheelSetupView else { return false }
+            return view.canvasContains(NSEvent.mouseLocation)
         }
         mouseInput.onStatus = { [weak self] value in self?.mouseStatus = value; self?.settingsView?.setMouseStatus(value) }
         mouseInput.bypass = { [weak self] type in
@@ -65,6 +85,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
             let settings = NSApp.isActive && self?.settingsWindow?.isVisible == true && self?.settingsWindow?.frame.contains(point) == true
             let ring = self?.panel?.isVisible == true
             return settings || ring
+        }
+        mouseInput.bypassScrolling = { [weak self] event in
+            guard let self else { return true }
+            let point = NSEvent.mouseLocation
+            let learningPage = self.probeWindow.map { window in
+                window.isVisible && NSWindow.windowNumber(at:point,belowWindowWithWindowNumber:0) == window.windowNumber
+            } ?? false
+            return ScrollInteractionScope.bypass(
+                targetPID:pid_t(event.getIntegerValueField(.eventTargetUnixProcessID)),ownPID:ProcessInfo.processInfo.processIdentifier,
+                recording:RecorderButton.isCapturing,ring:self.panel?.isVisible == true,
+                practice:learningPage && (self.probeWindow.map { $0.isVisible && ((($0.contentView as? NSScrollView)?.documentView as? WheelSetupView)?.canvasContains(point) == true) } ?? false),
+                settings:self.settingsWindow.map { $0.isVisible && $0.frame.contains(point) } ?? false,
+                applicationList:self.settingsView?.allowsSmoothScrolling(at:point) == true,learningPage:learningPage)
         }
         previousApp = NSWorkspace.shared.frontmostApplication
         mouseInput.router.applicationID = previousApp?.bundleIdentifier ?? ""
@@ -102,16 +135,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
         subscription = store.$config.debounce(for: .milliseconds(80), scheduler: DispatchQueue.main).sink { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.ring.loadConfiguration(); self.settingsView?.reloadFromStore(); self.updateMouseTap(); self.configureTarget()
+                self.ring.loadConfiguration(); self.haptics.configure(self.store.config.ringHaptics); self.settingsView?.reloadFromStore(); self.updateMouseTap(); self.configureTarget()
                 if self.panel.isVisible { self.refresh() }
             }
         }
         updateMouseTap()
-        if !CommandLine.arguments.contains("--background") { showSettings() }
+        startRuntimeTimer()
+        if !preview {
+            updateChecker.onResult = { [weak self] outcome,manual in self?.presentUpdateResult(outcome,manual:manual) }
+            updateChecker.onState = { [weak self] in
+                guard let self else { return }
+                (self.updateWindow?.contentView as? UpdatePromptView)?.setAutomatic(self.updatePreferences.automatic)
+            }
+            updateChecker.start()
+        }
+        if Self.opensSettingsAtLaunch(CommandLine.arguments) { showSettings() }
     }
+    static func opensSettingsAtLaunch(_ arguments:[String]) -> Bool { arguments.contains("--settings") }
     private func makePanel() {
         panel = DialPanel(contentRect: NSRect(origin: .zero, size: RingGeometry.size), styleMask: [.borderless], backing: .buffered, defer: false)
-        panel.title = "鼠环"
+        panel.title = appName
         panel.isReleasedWhenClosed = false
         panel.backgroundColor = NSColor.white.withAlphaComponent(0.001)
         panel.isOpaque = false
@@ -121,12 +164,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         ring = RingView(frame: NSRect(origin: .zero, size: RingGeometry.size)); ring.controller = self
+        ring.onHapticSelection = { [weak self] _ in self?.ringHapticHover() }
+        ring.onHapticClick = { [weak self] in self?.ringHapticClick() }
         ring.loadConfiguration(); panel.contentView = ring
     }
     private func makeMainMenu() {
         let main = NSMenu()
         let appItem = NSMenuItem(); main.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
+        let aboutItem = NSMenuItem(title:"关于 " + appName,action:#selector(showAbout),keyEquivalent:""); aboutItem.target = self; appMenu.addItem(aboutItem)
+        appendUpdateMenuItems(to:appMenu)
+        appMenu.addItem(.separator())
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(menuSettings), keyEquivalent: ","); settingsItem.target = self; appMenu.addItem(settingsItem)
         appMenu.addItem(.separator())
         let closeItem = NSMenuItem(title: "关闭界面，保留后台", action: #selector(closeToBackground), keyEquivalent: "q"); closeItem.target = self; appMenu.addItem(closeItem)
@@ -139,35 +187,88 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
     private func makeMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "circle.hexagongrid", accessibilityDescription: "鼠环")
-        statusItem.button?.toolTip = "鼠环"
+        statusItem.button?.toolTip = appName
         let menu = NSMenu()
-        let items: [(String, Selector, String)] = [("打开圆环", #selector(menuOpen), ""), ("设置…", #selector(menuSettings), ","), ("恢复屏幕可见", #selector(restoreDisplayVisibility), ""), ("完全退出鼠环", #selector(quit), "")]
+        let items: [(String, Selector, String)] = [("打开圆环", #selector(menuOpen), ""), ("设置…", #selector(menuSettings), ","), ("恢复屏幕可见", #selector(restoreDisplayVisibility), ""), ("关于 " + appName, #selector(showAbout), ""), ("完全退出鼠环", #selector(quit), "")]
         for (index, item) in items.enumerated() { if index == 3 { menu.addItem(.separator()) }; let entry = NSMenuItem(title: item.0, action: item.1, keyEquivalent: item.2); entry.target = self; menu.addItem(entry) }
+        let quit = menu.items.last!; menu.removeItem(quit)
+        appendUpdateMenuItems(to:menu); menu.addItem(.separator()); menu.addItem(quit)
         statusItem.menu = menu
+    }
+    func appendUpdateMenuItems(to menu:NSMenu) {
+        for (title,action) in [("检查更新…",#selector(checkForUpdates)),("自动检查更新",#selector(toggleAutomaticUpdates))] {
+            let item = NSMenuItem(title:title,action:action,keyEquivalent:""); item.target = self; menu.addItem(item)
+        }
+    }
+    func validateMenuItem(_ item:NSMenuItem) -> Bool {
+        if item.action == #selector(toggleAutomaticUpdates) { item.state = updatePreferences.automatic ? .on:.off }
+        if item.action == #selector(checkForUpdates) {
+            item.title = updateChecker.checking ? "正在检查更新…" : updateChecker.available.map { "发现新版本 \($0.tag)…" } ?? "检查更新…"
+            return !updateChecker.checking
+        }
+        return true
+    }
+    @objc func toggleAutomaticUpdates() { updateChecker.setAutomatic(!updatePreferences.automatic) }
+    @objc func checkForUpdates() {
+        guard !preview else { return }
+        updateChecker.check(manual:true)
+    }
+    private func presentUpdateResult(_ outcome:ReleaseUpdateChecker.Outcome,manual:Bool) {
+        switch outcome {
+        case .available(let release):
+            updateWindow?.close()
+            let window = NSPanel(contentRect:NSRect(x:0,y:0,width:440,height:220),styleMask:[.titled,.closable,.nonactivatingPanel],backing:.buffered,defer:false)
+            window.title = "鼠环更新"; window.isReleasedWhenClosed = false; window.hidesOnDeactivate = false; window.becomesKeyOnlyIfNeeded = true
+            let view = UpdatePromptView(release:release,current:ReleaseCatalog.currentTag,automatic:updatePreferences.automatic)
+            view.onAutomatic = { [weak self] in self?.updateChecker.setAutomatic($0) }
+            view.onLater = { [weak window] in window?.close() }
+            view.onDownload = { [weak window] in
+                guard ReleaseCatalog.validPage(release.page,tag:release.tag) else { return }
+                NSWorkspace.shared.open(release.page); window?.close()
+            }
+            window.contentView = view; window.center(); updateWindow = window
+            window.orderFrontRegardless()
+        case .current, .failed:
+            guard manual else { return }
+            let alert = NSAlert(); alert.messageText = "没有更新的版本"
+            alert.informativeText = "当前版本：" + ReleaseCatalog.currentTag
+            if case .failed(let error) = outcome { alert.messageText = "检查更新未完成"; alert.informativeText = error.localizedDescription }
+            alert.addButton(withTitle:"好"); NSApp.activate(ignoringOtherApps:true); alert.runModal()
+        }
     }
     @objc private func menuOpen() { toggleRing() }
     @objc private func menuSettings() { showSettings() }
+    @objc func showAbout() {
+        hideRing()
+        NSApp.setActivationPolicy(.regular)
+        if aboutWindow == nil {
+            let window = AboutView.makeWindow()
+            window.delegate = self; aboutWindow = window
+        }
+        NSApp.activate(ignoringOtherApps:true); aboutWindow?.makeKeyAndOrderFront(nil)
+    }
     @objc func restoreDisplayVisibility() { controls.restoreDisplayDimming { [weak self] in self?.refresh() } }
     @objc private func quit() { explicitExit = true; NSApp.terminate(nil) }
     @objc func closeToBackground() {
-        settingsView?.cancelRecording(); mouseInput.cancelDetection(); stopPermissionTimer()
+        settingsView?.cancelRecording(); mouseInput.cancelDetection()
         ((probeWindow?.contentView as? NSScrollView)?.documentView as? WheelSetupView)?.stop()
-        settingsWindow?.orderOut(nil); probeWindow?.orderOut(nil); hideRing(); store.flush()
+        settingsWindow?.orderOut(nil); probeWindow?.orderOut(nil); aboutWindow?.orderOut(nil); updateWindow?.orderOut(nil); hideRing(); store.flush()
         NSApp.setActivationPolicy(.accessory)
     }
     func applicationShouldTerminate(_ sender:NSApplication) -> NSApplication.TerminateReply {
         let reason = NSAppleEventManager.shared().currentAppleEvent?.paramDescriptor(forKeyword:AEKeyword(kAEQuitReason))?.enumCodeValue
         if explicitExit || [DescType(kAEQuitAll),DescType(kAEShutDown),DescType(kAERestart),DescType(kAEReallyLogOut)].contains(reason ?? 0) {
-            controls.restoreDisplayDimming { sender.reply(toApplicationShouldTerminate: true) }; return .terminateLater
+            runtimeStarted = false; updateChecker.stop(); updateWindow?.close(); stopPermissionTimer(); mouseInput.stop()
+            controls.restoreDisplayDimming { self.haptics.stop { sender.reply(toApplicationShouldTerminate:true) } }; return .terminateLater
         }
         closeToBackground(); return .terminateCancel
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showSettings()
         return false
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationWillTerminate(_ notification: Notification) {
+        updateChecker.stop()
         ((probeWindow?.contentView as? NSScrollView)?.documentView as? WheelSetupView)?.stop()
         settingsView?.cancelRecording(); store.flush()
         removeMouseTap()
@@ -179,11 +280,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
         timer?.invalidate()
     }
     func showRing(select action: DialAction? = nil) {
-        settingsView?.cancelRecording(); mouseInput.cancelDetection()
+        settingsView?.cancelRecording(); mouseInput.cancelDetection(); mouseInput.resetScrolling()
         if let current = NSWorkspace.shared.frontmostApplication, current.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = current }
         settingsWindow?.orderOut(nil); probeWindow?.orderOut(nil)
         ((probeWindow?.contentView as? NSScrollView)?.documentView as? WheelSetupView)?.stop()
-        stopPermissionTimer(); NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.accessory)
         anchor = NSEvent.mouseLocation
         let armedSlot = action.flatMap { kind in store.config.items.firstIndex(where: { $0.action == kind }) }
         ring.prepare(armedSlot: armedSlot, armedAction: armedSlot == nil ? action : nil)
@@ -193,6 +294,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
         let frame = RingGeometry.frame(near: anchor, screen: visible, scale: scale)
         panel.setFrame(frame, display: false); ring.frame = NSRect(origin: .zero, size: frame.size); ring.setScale(scale)
         configureTarget(); feedbackUntil = 0; feedbackToken += 1
+        if runtimeStarted && !preview { haptics.start(); haptics.configure(store.config.ringHaptics); haptics.beginRing() }
         showClickShields()
         NSApp.activate(ignoringOtherApps: true); panel.makeKeyAndOrderFront(nil); panel.makeFirstResponder(ring)
         renderCached()
@@ -209,16 +311,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
             window.contentView = view; window.orderFrontRegardless(); clickShields.append(window)
         }
     }
-    func hideRing() { clickShields.forEach { $0.orderOut(nil) }; clickShields.removeAll(); panel?.orderOut(nil); ring?.prepare(); feedbackToken += 1; feedbackUntil = 0 }
+    func hideRing() { if runtimeStarted && panel?.isVisible == true { haptics.endRing() }; clickShields.forEach { $0.orderOut(nil) }; clickShields.removeAll(); panel?.orderOut(nil); ring?.prepare(); feedbackToken += 1; feedbackUntil = 0 }
     func toggleRing() { panel.isVisible ? hideRing() : showRing() }
     func showSettings() {
+        if runtimeStarted && !preview { haptics.start(); haptics.configure(store.config.ringHaptics) }
         NSApp.setActivationPolicy(.regular)
         let selectedID = ring?.activeItem?.id
         hideRing()
         if settingsWindow == nil {
             let height = min(660, max(600, (NSScreen.main?.visibleFrame.height ?? 900) - 70))
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: height), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-            w.title = "鼠环设置"; w.isReleasedWhenClosed = false; w.delegate = self
+            w.title = appName+" 设置"; w.isReleasedWhenClosed = false; w.delegate = self
             let view = SettingsView(store: store, controller: self); settingsView = view
             let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 980, height: height))
             scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
@@ -230,24 +333,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
         NSApp.activate(ignoringOtherApps: true); settingsWindow?.makeKeyAndOrderFront(nil)
         settingsView?.setMouseStatus(mouseStatus)
         checkPermissions()
-        if timer == nil {
-            timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.checkPermissions() }
-            RunLoop.main.add(timer!, forMode: .common)
-        }
+        startRuntimeTimer()
+    }
+    private func startRuntimeTimer() {
+        guard timer == nil else { return }
+        timer = Timer(timeInterval:2,repeats:true) { [weak self] _ in self?.checkPermissions() }
+        RunLoop.main.add(timer!,forMode:.common)
     }
     private func checkPermissions() {
         let access = InputSender.trusted
         if accessibilityGranted != access { accessibilityGranted = access; updateMouseTap() }
+        if !preview { mouseInput.refreshRuntimeState(); haptics.start() }
         settingsView?.refreshPermission()
     }
     private func stopPermissionTimer() { timer?.invalidate(); timer = nil }
     func windowWillClose(_ notification: Notification) {
         if notification.object as? NSWindow == probeWindow { ((probeWindow?.contentView as? NSScrollView)?.documentView as? WheelSetupView)?.stop() }
-        if notification.object as? NSWindow == settingsWindow { settingsView?.cancelRecording(); stopPermissionTimer(); mouseInput.cancelDetection() }
+        if notification.object as? NSWindow == settingsWindow { settingsView?.cancelRecording(); mouseInput.cancelDetection() }
         let closing = notification.object as? NSWindow
         DispatchQueue.main.async { [weak self] in
             guard let self else{return}
-            let visible = [self.settingsWindow,self.probeWindow].compactMap{$0}.contains { $0 !== closing && $0.isVisible }
+            let visible = [self.settingsWindow,self.probeWindow,self.aboutWindow].compactMap{$0}.contains { $0 !== closing && $0.isVisible }
             if !visible { NSApp.setActivationPolicy(.accessory) }
         }
     }
@@ -304,6 +410,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
         renderCached()
         if panel.isVisible { controls.request(.volume, force: true); controls.request(.brightness, force: true) }
     }
+    func testRingHaptics() {
+        guard runtimeStarted,!preview else { return }
+        haptics.start(userInitiated:true); haptics.configure(store.config.ringHaptics); haptics.test()
+    }
+    private func ringHapticHover() { if runtimeStarted && !preview && panel?.isVisible == true { haptics.hover() } }
+    private func ringHapticClick() { if runtimeStarted && !preview && panel?.isVisible == true { haptics.confirm() } }
     func hoverChanged() {
         feedbackUntil = 0; feedbackToken += 1
         renderCached()
@@ -374,6 +486,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, Ob
             case .previous, .playPause, .next:
                 try InputSender.media(action == .previous ? 18 : action == .next ? 17 : 16)
                 feedback("已发送", detail: item.title, error: false)
+            case .showDesktop:
+                hideRing()
+                try desktopController.toggle()
             case .shortcut:
                 guard let binding = item.shortcut else { throw ControlFailure(message: "先在设置中为此项录制快捷键") }
                 guard InputSender.trusted else { throw ControlFailure(message: "需要辅助功能授权 · 菜单栏 → 设置") }

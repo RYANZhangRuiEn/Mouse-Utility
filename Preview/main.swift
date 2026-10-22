@@ -66,9 +66,9 @@ inherited.state = .on; _ = app.sendAction(inherited.action!,to:inherited.target,
 if store.config.smoothScroll.tuning(for:"com.example.Reader")?.pixelsPerStep != 36 { fatalError("global inheritance failed") }; smoothUIChecks += 1
 inherited.state = .off; _ = app.sendAction(inherited.action!,to:inherited.target,from:inherited)
 if store.config.smoothScroll.tuning(for:"com.example.Reader")?.pixelsPerStep != 73 { fatalError("inheritance erased independent settings") }; smoothUIChecks += 1
-let globalSwitch = descendantsForPreview(settings).compactMap { $0 as? NSButton }.first { $0.title == "启用平滑滚动" }!
+let globalSwitch = descendantsForPreview(settings).compactMap { $0 as? NSButton }.first { $0.title == "全局平滑滚动" }!
 globalSwitch.state = .off; _ = app.sendAction(globalSwitch.action!,to:globalSwitch.target,from:globalSwitch)
-if store.config.smoothScroll.enabled || distanceControl.isEnabled { fatalError("disabled smoothing left editable controls") }; smoothUIChecks += 1
+if store.config.smoothScroll.enabled || !distanceControl.isEnabled { fatalError("global smoothing switch incorrectly disabled independent application tuning") }; smoothUIChecks += 1
 globalSwitch.state = .on; _ = app.sendAction(globalSwitch.action!,to:globalSwitch.target,from:globalSwitch)
 let converter = descendantsForPreview(settings).compactMap { $0 as? NSPopUpButton }.first { $0.accessibilityLabel() == "转为横向控制键" }!
 converter.selectItem(withTag:2); _ = app.sendAction(converter.action!,to:converter.target,from:converter)
@@ -164,16 +164,18 @@ store.config.mouseHabits.adaptation.appZoom["com.microsoft.Word"] = wordFit
 let adaptation = WheelSetupView(store:store,zoom:false)
 let primary = descendants(adaptation).compactMap { $0 as? NSButton }.first { $0.title == "开始学习" }!
 _ = app.sendAction(primary.action!,to:primary.target,from:primary)
-for sign in [1.0,-1.0] {
+for (round,sign) in [1.0,-1.0].enumerated() {
     if primary.isEnabled { fatalError("empty learning round accepted") }; adaptationChecks += 1
-    for i in 0..<20 {
+    for i in 0..<10 {
+      for fragment in 0..<2 {
         let pulse = CGEvent(scrollWheelEvent2Source:nil,units:.line,wheelCount:2,wheel1:sign>0 ? 2:-2,wheel2:0,wheel3:0)!
         pulse.setDoubleValueField(.scrollWheelEventRawDeltaAxis1,value:sign*3)
-        adaptation.receive(pulse,time:Double(i)*0.01)
+        adaptation.receive(pulse,time:Double(round*4)+Double(i)*0.2+Double(fragment)*0.01)
+      }
+      adaptation.finishLearningBurst(at:Double(round*4)+Double(i)*0.2+0.11)
     }
     let side = CGEvent(scrollWheelEvent2Source:nil,units:.line,wheelCount:2,wheel1:0,wheel2:100,wheel3:0)!
     adaptation.receive(side,time:1)
-    _ = app.sendAction(primary.action!,to:primary.target,from:primary)
 }
 if primary.title != "完成" || store.config.ringWheel.profile.units["raw"] != 6 || store.config.ringWheel.profile.samples != 20 { fatalError("ring learning failed") }; adaptationChecks += 1
 if store.config.mouseHabits.adaptation.zoomProfile != workingZoom || store.config.mouseHabits.adaptation.appZoom["com.microsoft.Word"] != wordFit { fatalError("ring learning changed zoom") }; adaptationChecks += 1
@@ -186,9 +188,11 @@ let ringBeforeZoom = store.config.ringWheel
 let zoomSetup = WheelSetupView(store:store,zoom:true)
 let zoomPrimary = descendants(zoomSetup).compactMap { $0 as? NSButton }.first { $0.title == "开始学习" }!
 _ = app.sendAction(zoomPrimary.action!,to:zoomPrimary.target,from:zoomPrimary)
-for sign in [1.0,-1.0] {
-    for i in 0..<20 { let pulse = learnedPulse.copy()!; pulse.setDoubleValueField(.scrollWheelEventRawDeltaAxis1,value:sign*1); zoomSetup.receive(pulse,time:Double(i)*0.01) }
-    _ = app.sendAction(zoomPrimary.action!,to:zoomPrimary.target,from:zoomPrimary)
+for (round,sign) in [1.0,-1.0].enumerated() {
+    for i in 0..<10 {
+        for fragment in 0..<2 { let pulse = learnedPulse.copy()!; pulse.setDoubleValueField(.scrollWheelEventRawDeltaAxis1,value:sign); zoomSetup.receive(pulse,time:Double(round*4)+Double(i)*0.2+Double(fragment)*0.01) }
+        zoomSetup.finishLearningBurst(at:Double(round*4)+Double(i)*0.2+0.11)
+    }
 }
 if store.config.ringWheel != ringBeforeZoom || store.config.mouseHabits.adaptation.zoomProfile?.units["raw"] != 2 { fatalError("zoom learning changed ring or failed to save") }; adaptationChecks += 1
 try renderView(WheelSetupView(store:store,zoom:true),size:NSSize(width:680,height:616),name:"缩放手感预览.png")
@@ -319,12 +323,12 @@ print("PASS: \(navigationChecks) view navigation checks. Rendered root ring, sub
 // Window lifetime checks use a separate controller with no event tap and an in-memory store.
 let lifecycle = AppController(store:SettingsStore(persistent:false))
 lifecycle.showSettings()
-if app.activationPolicy() != .regular || !app.windows.contains(where:{$0.title == "鼠环设置" && $0.isVisible}) { fatalError("settings did not open with Dock presence") }
+if app.activationPolicy() != .regular || !app.windows.contains(where:{$0.title == appName+" 设置" && $0.isVisible}) { fatalError("settings did not open with Dock presence") }
 lifecycle.closeToBackground()
-if app.activationPolicy() != .accessory || app.windows.contains(where:{$0.title == "鼠环设置" && $0.isVisible}) { fatalError("background close left Dock/window visible") }
+if app.activationPolicy() != .accessory || app.windows.contains(where:{$0.title == appName+" 设置" && $0.isVisible}) { fatalError("background close left Dock/window visible") }
 if lifecycle.applicationShouldTerminateAfterLastWindowClosed(app) { fatalError("closing final window terminated background service") }
 if lifecycle.applicationShouldTerminate(app) != .terminateCancel { fatalError("ordinary application quit did not remain in background") }
 _ = lifecycle.applicationShouldHandleReopen(app,hasVisibleWindows:false)
-if app.activationPolicy() != .regular || !app.windows.contains(where:{$0.title == "鼠环设置" && $0.isVisible}) { fatalError("reopen did not return to settings") }
+if app.activationPolicy() != .accessory || app.windows.contains(where:{$0.title == appName+" 设置" && $0.isVisible}) { fatalError("silent reopen unexpectedly opened settings") }
 lifecycle.closeToBackground()
 print("PASS: 5 settings/Dock/background/reopen lifetime checks; no event tap installed, no settings persisted.")

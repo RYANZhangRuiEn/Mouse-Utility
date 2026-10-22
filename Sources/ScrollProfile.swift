@@ -56,14 +56,23 @@ struct SmoothScrollSettings: Codable, Equatable {
     var onlyListed = false
     var global = ScrollTuning()
     var applications: [ScrollApplication] = []
-    var needsListening: Bool { enabled }
-    func tuning(for bundleID: String?) -> ScrollTuning? {
-        guard enabled else { return nil }
+    private func needs(_ value:ScrollTuning) -> Bool {
+        value.smoothVertical || value.smoothHorizontal || value.reverseVertical || value.reverseHorizontal || value.boostKey.device != .none || value.horizontalKey.device != .none
+    }
+    var needsListening:Bool {
+        needs(globalTuning) || applications.contains { $0.enabled && !$0.useGlobal && needs($0.options) }
+    }
+    private var globalTuning:ScrollTuning {
+        var value = global.sanitized()
+        if !enabled { value.smoothVertical = false; value.smoothHorizontal = false }
+        return value
+    }
+    func tuning(for bundleID:String?) -> ScrollTuning? {
         if let rule = applications.first(where: { $0.bundleID == bundleID }) {
             guard rule.enabled else { return nil }
-            return (rule.useGlobal ? global:rule.options).sanitized()
+            return rule.useGlobal ? globalTuning:rule.options.sanitized()
         }
-        return onlyListed ? nil:global.sanitized()
+        return onlyListed ? nil:globalTuning
     }
     func sanitized() -> SmoothScrollSettings {
         var value = self; value.global = global.sanitized()
